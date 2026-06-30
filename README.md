@@ -76,11 +76,25 @@ sudo make install
 
 ### 6. Set up a keyboard shortcut (GNOME)
 
+**Option A: Settings UI (recommended)**
+
+1. Open **Settings → Keyboard → Keyboard Shortcuts → "View and Customize Shortcuts"**
+2. Scroll to **Custom Shortcuts** and click **`+`**
+3. Fill in:
+   - **Name:** `xhisper`
+   - **Command:** `/usr/local/bin/xhisper`
+   - **Shortcut:** click "Set Shortcut" and press your preferred key
+4. Click **Add**. The shortcut takes effect immediately — no logout needed.
+
+> **Pick a combo the focused app won't swallow.** A plain `Alt`+letter is captured by application menu mnemonics and never reaches xhisper, so prefer `Ctrl+Alt`+key (e.g. `Ctrl+Alt+Z`), a `Super` combo, or a dedicated key like `Pause`.
+
+**Option B: Command line**
+
 Run the following in a terminal to bind xhisper to a key. Change `binding` to your preferred shortcut:
 
 ```sh
 name="xhisper"
-binding="Pause"  # Pause/Break key. Other examples: "<Alt>d", "<CTRL><SHIFT>X"
+binding="Pause"  # Pause/Break key. Other examples: "<Control><Alt>z", "<CTRL><SHIFT>X"
 action="/usr/local/bin/xhisper"
 
 media_keys=org.gnome.settings-daemon.plugins.media-keys
@@ -92,6 +106,8 @@ gsettings set $custom_kbd:$kbd_path name "$name"
 gsettings set $custom_kbd:$kbd_path binding "$binding"
 gsettings set $custom_kbd:$kbd_path command "$action"
 ```
+
+> If a shortcut set this way doesn't trigger, set it via **Option A** instead — the Settings UI registers it in a form GNOME always grabs reliably.
 
 ---
 

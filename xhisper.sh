@@ -16,6 +16,36 @@
 
 OS=$(uname)
 
+# Run with the system toolchain, not an active conda env or virtualenv (Linux).
+# `conda activate` and venvs only prepend their bin dir to PATH and export
+# CONDA_*/VIRTUAL_ENV. When such an env is active, its python3 may lack the
+# system GObject-introspection (Gtk) modules used by the status overlay and,
+# on X11, can segfault while loading libX11 during key-release detection; tools
+# like jq/curl/ffmpeg may also resolve to env builds. We replicate `deactivate`
+# here — without the slow `conda` shell hook — so xhisper behaves the same
+# whether or not the caller has an env active. Every tool xhisper needs is
+# provided by the OS (see Requirements above), so dropping the env is safe.
+# Linux-only: on macOS the key-release detection imports Quartz (pyobjc) from
+# the user's Python, which Apple's system python3 does not provide, so leave
+# the macOS environment untouched.
+if [ "$OS" = "Linux" ] && { [ -n "${CONDA_PREFIX:-}" ] || [ -n "${CONDA_DEFAULT_ENV:-}" ] || [ -n "${VIRTUAL_ENV:-}" ]; }; then
+  _clean_path=""
+  _saved_ifs="$IFS"; IFS=':'
+  for _dir in $PATH; do
+    case "$_dir" in
+      *anaconda*|*miniconda*|*miniforge*|*/condabin|*/condabin/*|*/envs/*|*/.venv/*|*/virtualenvs/*) continue ;;
+    esac
+    [ -n "${CONDA_PREFIX:-}" ] && [ "${_dir#"$CONDA_PREFIX"}" != "$_dir" ] && continue
+    [ -n "${VIRTUAL_ENV:-}" ]  && [ "${_dir#"$VIRTUAL_ENV"}"  != "$_dir" ] && continue
+    _clean_path="${_clean_path:+$_clean_path:}$_dir"
+  done
+  IFS="$_saved_ifs"
+  export PATH="$_clean_path"
+  unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL CONDA_PROMPT_MODIFIER \
+        CONDA_PYTHON_EXE CONDA_EXE _CE_CONDA _CE_M VIRTUAL_ENV PYTHONHOME PYTHONPATH \
+        _dir _clean_path _saved_ifs
+fi
+
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 
 # Parse command-line arguments
@@ -166,13 +196,24 @@ else
       exit 1
   fi
 
-  # Detect clipboard tool
-  if command -v wl-copy &> /dev/null; then
+  # Detect clipboard tool based on the active display server. Prefer the tool
+  # that matches the session and fall back to the other if it isn't installed.
+  # Picking wl-copy on an X11 session fails (no Wayland compositor to talk to),
+  # so key off XDG_SESSION_TYPE (with WAYLAND_DISPLAY as a fallback signal)
+  # rather than whichever binary happens to be installed first.
+  session=${XDG_SESSION_TYPE:-}
+  if [ -z "$session" ]; then
+      [ -n "$WAYLAND_DISPLAY" ] && session="wayland" || session="x11"
+  fi
+  if [ "$session" = "wayland" ] && command -v wl-copy &> /dev/null; then
       CLIP_COPY="wl-copy"
       CLIP_PASTE="wl-paste"
   elif command -v xclip &> /dev/null; then
       CLIP_COPY="xclip -selection clipboard"
       CLIP_PASTE="xclip -o -selection clipboard"
+  elif command -v wl-copy &> /dev/null; then
+      CLIP_COPY="wl-copy"
+      CLIP_PASTE="wl-paste"
   else
       echo "Error: No clipboard tool found." >&2
       exit 1
@@ -185,8 +226,20 @@ press_wrap_key() {
   fi
 }
 
+# WM_CLASS values for common Ubuntu/Linux terminal emulators (instance and/or class name).
+# Checked first since it's stable; falls back to the title heuristic when class is unavailable
+# (e.g. unsupported session) or doesn't match, so behavior never regresses vs. title-only matching.
 is_terminal_window() {
-  local wname_lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+  local wclass_lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+  local wname_lower=$(echo "$2" | tr '[:upper:]' '[:lower:]')
+
+  if [ -n "$wclass_lower" ]; then
+    case "$wclass_lower" in
+      *gnome-terminal*|*ptyxis*|*org.gnome.console*|*kgx*|konsole|org.kde.konsole|*xterm*|alacritty|kitty|*wezterm*|*warp*|foot|footclient|tilix|terminator|yakuake|urxvt*|rxvt*|st|terminology|sakura|lxterminal|xfce4-terminal|mate-terminal|deepin-terminal|guake|qterminal|hyper|cool-retro-term|*blackbox*|tilda|eterm|terminus) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+
   case "$wname_lower" in
     *terminal*|*konsole*|*alacritty*|*kitty*|*wezterm*|*foot*|*xterm*|*tilix*|*terminator*|*yakuake*|*urxvt*|*rxvt*|*st-*|*tmux*|*iterm*|*warp*) return 0 ;;
     *) return 1 ;;
@@ -196,17 +249,18 @@ is_terminal_window() {
 paste() {
   local text="$1"
   local wname="$2"
+  local wclass="$3"
   press_wrap_key
   echo -n "$text" | $CLIP_COPY
   sleep 0.05
   if [ "$OS" = "Darwin" ]; then
-    if is_terminal_window "$wname"; then
+    if is_terminal_window "" "$wname"; then
       osascript -e 'tell application "System Events" to keystroke "v" using {command down, shift down}'
     else
       osascript -e 'tell application "System Events" to keystroke "v" using command down'
     fi
   else
-    if is_terminal_window "$wname"; then
+    if is_terminal_window "$wclass" "$wname"; then
       "$XHISPERTOOL" shift-paste
     else
       "$XHISPERTOOL" paste
@@ -327,6 +381,32 @@ get_active_window() {
     fi
   fi
   echo "$wname"
+}
+
+# Window title (WM_NAME) is freeform and app/user-controlled (cwd, running command, etc.),
+# so it's unreliable for identifying the app. Window class (WM_CLASS) is fixed by the
+# toolkit at window-creation time and is the correct signal for "what app is this".
+# On macOS, get_active_window already returns the process name, which is class-equivalent.
+get_active_window_class() {
+  [ "$OS" = "Darwin" ] && return
+  local wclass=""
+  local session=${XDG_SESSION_TYPE:-x11}
+  if [ "$session" != "wayland" ]; then
+    if command -v xdotool &> /dev/null && command -v xprop &> /dev/null; then
+      wclass=$(xprop -id "$(xdotool getactivewindow 2>/dev/null)" WM_CLASS 2>/dev/null | sed -n 's/.*, "\(.*\)"$/\1/p')
+    elif command -v xprop &> /dev/null; then
+      wclass=$(xprop -id "$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $NF}')" WM_CLASS 2>/dev/null | sed -n 's/.*, "\(.*\)"$/\1/p')
+    fi
+  else
+    if command -v gdbus &> /dev/null; then
+      wclass=$(gdbus call --session --dest org.gnome.Shell \
+        --object-path /org/gnome/Shell \
+        --method org.gnome.Shell.Eval \
+        'global.display.focus_window ? global.display.focus_window.get_wm_class() : ""' \
+        2>/dev/null | sed -n "s/^(true, '\(.*\)')$/\1/p")
+    fi
+  fi
+  echo "$wclass"
 }
 
 get_tone_for_window() {
@@ -568,6 +648,7 @@ TRANSCRIPTION=$(transcribe "$RECORDING")
 
 # Detect active window (used for tone adaptation and paste method)
 ACTIVE_WINDOW=$(get_active_window)
+ACTIVE_WINDOW_CLASS=$(get_active_window_class)
 
 # AI auto-editing
 if [ "$auto_edit" = "true" ] && [ -n "$TRANSCRIPTION" ]; then
@@ -581,7 +662,7 @@ if [ "$auto_edit" = "true" ] && [ -n "$TRANSCRIPTION" ]; then
   TRANSCRIPTION=$(auto_edit_text "$TRANSCRIPTION" "$TONE")
 fi
 
-paste "$TRANSCRIPTION" "$ACTIVE_WINDOW"
+paste "$TRANSCRIPTION" "$ACTIVE_WINDOW" "$ACTIVE_WINDOW_CLASS"
 
 # Show done overlay briefly
 show_status done --timeout 1500
