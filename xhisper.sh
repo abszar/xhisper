@@ -3,7 +3,9 @@
 # xhisper v1.4 - Push-to-talk
 # Dictate anywhere on Linux or macOS. Transcription at your cursor.
 # Hold your shortcut key to record, release to transcribe.
-# Press the shortcut again while a recording is live to stop it immediately.
+# `xhisper --stop` ends a live recording (bind it to a second key if you want
+# a stop shortcut). A duplicate invocation of the hotkey itself is ignored,
+# because holding a key auto-repeats and the desktop relaunches on every repeat.
 
 # Requirements (Linux):
 # - pipewire, pipewire-utils (audio)
@@ -45,7 +47,8 @@ xhisper $VERSION — push-to-talk voice dictation at your cursor.
 Usage: xhisper [options]
 
 Hold your shortcut key to record, release to transcribe and paste.
-Pressing the shortcut again while a recording is live stops it immediately.
+A duplicate invocation while recording is ignored: holding a key auto-repeats
+and the desktop relaunches the command on every repeat. Use --stop to end one.
 
 Options:
   --local     Use the binaries next to this script instead of the installed ones
@@ -122,27 +125,6 @@ if [ "$OS" = "Darwin" ]; then
 else
   PROCESS_PATTERN="pw-record.*$RECORDING"
 fi
-
-# A live instance holds the PID file. A second press means "stop recording now"
-# rather than "do nothing", so a stuck run can never wedge the hotkey.
-instance_alive() {
-  kill -0 "$1" 2>/dev/null || return 1
-  if [ -r "/proc/$1/cmdline" ]; then
-    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q xhisper || return 1
-  fi
-  return 0
-}
-
-if [ -f "$PIDFILE" ]; then
-  OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
-  if [ -n "$OLD_PID" ] && instance_alive "$OLD_PID"; then
-    touch "$STOPFILE"
-    exit 0
-  fi
-  rm -f "$PIDFILE"
-fi
-rm -f "$STOPFILE"
-echo $$ > "$PIDFILE"
 
 # Default configuration
 long_recording_threshold=1000
@@ -222,6 +204,36 @@ if [ -f "$DICTIONARY_FILE" ]; then
     fi
   fi
 fi
+
+# Only one recording at a time. Holding a hotkey auto-repeats — X11 defaults to
+# 33 presses per second after 500 ms — and the desktop launches the command on
+# every one of those, so a duplicate invocation is almost always the same press,
+# not a deliberate one. It is ignored. Use `xhisper --stop` to end a recording
+# on purpose; bind it to a second key if you want a stop shortcut.
+instance_alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/cmdline" ]; then
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q xhisper || return 1
+  fi
+  return 0
+}
+
+# Past every timeout the pipeline can hit, a live instance is wedged, not busy.
+stuck_after=$(( max_recording_seconds + stt_timeout + llm_timeout + 60 ))
+if [ -f "$PIDFILE" ]; then
+  read -r OLD_PID OLD_START < "$PIDFILE" 2>/dev/null
+  if [ -n "$OLD_PID" ] && instance_alive "$OLD_PID"; then
+    OLD_AGE=0
+    [ -n "$OLD_START" ] && OLD_AGE=$(( $(date +%s) - OLD_START ))
+    if [ "$OLD_AGE" -lt "$stuck_after" ] 2>/dev/null; then
+      exit 0
+    fi
+    kill "$OLD_PID" 2>/dev/null
+  fi
+  rm -f "$PIDFILE"
+fi
+rm -f "$STOPFILE"
+printf '%s %s\n' "$$" "$(date +%s)" > "$PIDFILE"
 
 log_line() {
   printf '%s\n' "$1" >> "$LOGFILE"
@@ -642,9 +654,11 @@ auto_edit_text() {
 
 # Wait for all keys to be released (push-to-talk detection)
 # Auto-detects X11 vs Wayland and uses the appropriate method.
+# Prints why the recording ended (the single most useful line in the log when
+# push-to-talk misbehaves) and sets KEY_REASON.
 # Exit codes: 0 = released (or nothing was held), 3 = cannot read the keyboard.
 wait_for_key_release() {
-  XHISPER_MAX_SECONDS="$max_recording_seconds" python3 << 'PYEOF'
+  KEY_REASON=$(XHISPER_MAX_SECONDS="$max_recording_seconds" python3 << 'PYEOF'
 import os, sys, time
 
 stopfile = os.environ.get('XHISPER_STOPFILE')
@@ -655,30 +669,36 @@ except ValueError:
     max_seconds = 0
 deadline = time.time() + max_seconds if max_seconds > 0 else None
 
+def finish(reason, code=0):
+    print(reason)
+    raise SystemExit(code)
+
 def stop_requested():
-    """True when another press asked us to stop, or the recording ran too long."""
+    """Why we should stop early, or None to keep recording."""
     if deadline and time.time() > deadline:
-        return True
-    return bool(stopfile) and os.path.exists(stopfile)
+        return 'max-recording-seconds reached'
+    if stopfile and os.path.exists(stopfile):
+        return 'stop requested (xhisper --stop)'
+    return None
 
 if sys.platform == 'darwin':
     # macOS: use Quartz CGEventSource to detect key state
     try:
         from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
     except ImportError:
-        exit(3)
+        finish('cannot read the keyboard (Quartz missing)', 3)
     time.sleep(0.05)
     # Find which keys are currently pressed (scan common key range 0-127)
     pressed = [k for k in range(128) if CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, k)]
     if not pressed:
-        exit(0)
+        finish('no key was held (treated as a tap)')
     while True:
         time.sleep(0.05)
-        if stop_requested():
-            break
+        reason = stop_requested()
+        if reason:
+            finish(reason)
         if not any(CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, k) for k in pressed):
-            break
-    exit(0)
+            finish('key released')
 
 session = os.environ.get('XDG_SESSION_TYPE', 'x11')
 
@@ -688,10 +708,10 @@ if session != 'wayland':
     try:
         X11 = cdll.LoadLibrary("libX11.so.6")
     except OSError:
-        exit(3)
+        finish('cannot read the keyboard (libX11 missing)', 3)
     display = X11.XOpenDisplay(None)
     if not display:
-        exit(3)
+        finish('cannot read the keyboard (no X display)', 3)
     keys_start = (c_char * 32)()
     keys_check = (c_char * 32)()
     time.sleep(0.05)
@@ -704,11 +724,13 @@ if session != 'wayland':
                 pressed.add(i * 8 + bit)
     if not pressed:
         X11.XCloseDisplay(display)
-        exit(0)
+        finish('no key was held (treated as a tap)')
     while True:
         time.sleep(0.05)
-        if stop_requested():
-            break
+        reason = stop_requested()
+        if reason:
+            X11.XCloseDisplay(display)
+            finish(reason)
         X11.XQueryKeymap(display, keys_check)
         still = False
         for kc in pressed:
@@ -720,6 +742,7 @@ if session != 'wayland':
         if not still:
             break
     X11.XCloseDisplay(display)
+    finish('key released')
 else:
     # Wayland: use evdev (kernel input subsystem)
     import fcntl, glob
@@ -761,7 +784,7 @@ else:
     if not fds:
         # No readable keyboard: without this the recording would stop instantly
         # and look like "no sound detected".
-        exit(3)
+        finish('cannot read the keyboard (no readable /dev/input device)', 3)
 
     time.sleep(0.05)
     buf = bytearray(BUF)
@@ -770,12 +793,14 @@ else:
         initial |= get_pressed(fd, buf)
     if not initial:
         for fd in fds: os.close(fd)
-        exit(0)
+        finish('no key was held (treated as a tap)')
 
     while True:
         time.sleep(0.05)
-        if stop_requested():
-            break
+        reason = stop_requested()
+        if reason:
+            for fd in fds: os.close(fd)
+            finish(reason)
         still = False
         for fd in fds:
             if initial & get_pressed(fd, buf):
@@ -786,7 +811,9 @@ else:
 
     for fd in fds:
         os.close(fd)
+    finish('key released')
 PYEOF
+)
 }
 
 # Cleanup
@@ -906,6 +933,7 @@ else
 fi
 log_line "=== Recording ==="
 log_line "Duration: ${RECORDING_DURATION}s, Size: ${RECORDING_SIZE} bytes"
+log_line "Ended because: ${KEY_REASON:-unknown}"
 
 # Check if recording is silent
 if is_silent "$RECORDING"; then

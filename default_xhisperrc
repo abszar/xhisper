@@ -18,7 +18,8 @@ language                 : ""
 
 # Recording:
 # Hard cap on a single recording, in seconds. Protects against a stuck key.
-# Pressing the shortcut again while recording always stops it immediately.
+# 'xhisper --stop' ends a live recording; bind it to a second key for a stop
+# shortcut. Pressing the dictation hotkey again does nothing, on purpose.
 max-recording-seconds    : 300
 
 # Silence Detection:
