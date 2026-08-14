@@ -1,6 +1,10 @@
 # xhisper configuration
 # Copy to ~/.config/xhisper/xhisperrc and customize
 # When in doubt, check by running 'xhisper --log'
+#
+# Syntax: key : value
+# A "#" starts a comment anywhere on the line. Quote the value if it must
+# contain a "#" — for example: transcription-prompt : "C# and F#"
 
 # Transcription Settings:
 long-recording-threshold : 1000
@@ -12,21 +16,26 @@ transcription-prompt     : ""
 # code (en, fr, de, es, ar, ...) to force a specific language instead.
 language                 : ""
 
-# Paste Timing (seconds):
-non-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.
-non-ascii-default-delay : 0.025
+# Recording:
+# Hard cap on a single recording, in seconds. Protects against a stuck key.
+# Pressing the shortcut again while recording always stops it immediately.
+max-recording-seconds    : 300
 
 # Silence Detection:
-silence-threshold  : -50
-silence-percentage : 95
+# Recordings whose peak volume stays under this many dB are discarded.
+silence-threshold        : -50
 
 # AI Auto-editing:
-# Cleans up grammar, removes filler words, fixes punctuation after transcription.
-auto-edit        : true
+# Removes filler words, stutters and false starts, applies spoken self-corrections
+# ("Tuesday, no wait, Wednesday"), and fixes punctuation. It never rewrites your
+# wording; if the model returns something suspicious, the raw transcription is
+# pasted instead.
+auto-edit                : true
 
 # Tone Adaptation:
-# Detects the active window and adjusts auto-edit style (e.g., casual for Slack, formal for email).
-tone-adaptation  : true
+# Detects the active window and lets it influence punctuation and formatting
+# (chat vs email vs code editor). It never changes your wording or length.
+tone-adaptation          : true
 
 # Personal Dictionary:
 # Add custom words/names to ~/.config/xhisper/dictionary.txt (one per line)
@@ -40,11 +49,13 @@ tone-adaptation  : true
 # stt-url     : https://api.groq.com/openai/v1
 # stt-api-key :
 # stt-model   :
+# stt-timeout : 90            # seconds before the request is given up on
 #
 # LLM (auto-edit):
 # llm-url     : https://api.groq.com/openai/v1
 # llm-api-key :
 # llm-model   : llama-3.3-70b-versatile
+# llm-timeout : 30            # seconds before the raw transcription is pasted instead
 #
 # Local Whisper example (whisper.cpp server):
 # stt-url     : http://localhost:8080/v1
@@ -55,4 +66,3 @@ tone-adaptation  : true
 # llm-url     : http://localhost:11434/v1
 # llm-api-key :
 # llm-model   : llama3
-

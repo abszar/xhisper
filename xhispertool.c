@@ -3,6 +3,7 @@
  * Combined daemon and client for text input via uinput
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,8 @@
 #include <errno.h>
 #include <stdint.h>
 #include <libgen.h>
+#include <signal.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <linux/uinput.h>
@@ -26,6 +29,8 @@
 
 // Function prototypes
 void cleanup(void);
+void on_signal(int sig);
+ssize_t recv_command(char *buf, size_t buflen);
 void emit(int type, int code, int val);
 void do_paste(void);
 void do_shift_paste(void);
@@ -130,13 +135,57 @@ void cleanup() {
     }
 }
 
+void on_signal(int sig) {
+    (void)sig;
+    cleanup();
+    _exit(0);
+}
+
+// The daemon injects keystrokes into the user's session, so only accept
+// datagrams whose sender runs under the same uid.
+ssize_t recv_command(char *buf, size_t buflen) {
+    struct iovec iov = { .iov_base = buf, .iov_len = buflen };
+    char control[CMSG_SPACE(sizeof(struct ucred))];
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control,
+        .msg_controllen = sizeof(control)
+    };
+
+    ssize_t n = recvmsg(fd_socket, &msg, 0);
+    if (n < 0) {
+        return -1;
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+        cmsg->cmsg_type != SCM_CREDENTIALS ||
+        cmsg->cmsg_len != CMSG_LEN(sizeof(struct ucred))) {
+        fprintf(stderr, "xhispertoold: dropped command without credentials\n");
+        return -1;
+    }
+
+    struct ucred cred;
+    memcpy(&cred, CMSG_DATA(cmsg), sizeof(cred));
+    if (cred.uid != getuid()) {
+        fprintf(stderr, "xhispertoold: dropped command from uid %u\n",
+                (unsigned)cred.uid);
+        return -1;
+    }
+
+    return n;
+}
+
 void emit(int type, int code, int val) {
     struct input_event ie = {
         .type = type,
         .code = code,
         .value = val
     };
-    write(fd_uinput, &ie, sizeof(ie));
+    if (write(fd_uinput, &ie, sizeof(ie)) != (ssize_t)sizeof(ie)) {
+        perror("xhispertoold: failed to write input event");
+    }
 }
 
 void do_paste() {
@@ -286,6 +335,13 @@ int setup_socket() {
         return -1;
     }
 
+    // Ask the kernel to attach the sender's uid/pid to every datagram
+    int enable = 1;
+    if (setsockopt(fd_socket, SOL_SOCKET, SO_PASSCRED, &enable, sizeof(enable)) < 0) {
+        perror("failed to enable credential passing");
+        return -1;
+    }
+
     // Use abstract namespace socket (Linux-specific)
     // First byte is null, no filesystem entry, kernel manages lifecycle
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
@@ -307,6 +363,8 @@ int setup_socket() {
 // Daemon mode
 int run_daemon() {
     atexit(cleanup);
+    signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal);
 
     if (setup_uinput() < 0) {
         return 1;
@@ -316,11 +374,11 @@ int run_daemon() {
         return 1;
     }
 
-    printf("xhispertoold: listening on @xhisper_socket\n");
+    fprintf(stderr, "xhispertoold: listening on @xhisper_socket\n");
 
     char buf[2];
     while (1) {
-        ssize_t n = recv(fd_socket, buf, sizeof(buf), 0);
+        ssize_t n = recv_command(buf, sizeof(buf));
         if (n >= 1) {
             char cmd = buf[0];
             if (cmd == 'p') {

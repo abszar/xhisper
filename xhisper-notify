@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """xhisper-notify: Animated wave pill overlay for xhisper status."""
 
-import gi
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib
-import cairo
 import math
 import sys
 import os
 import signal
 import time
 
+# GTK is optional: without PyGObject we degrade to desktop notifications
+# instead of crashing and leaving the user with no feedback at all.
+HAS_GTK = True
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib
+    import cairo
+except (ImportError, ValueError):
+    HAS_GTK = False
+
 # Detect Wayland and try gtk-layer-shell for overlay positioning
 IS_WAYLAND = os.environ.get('XDG_SESSION_TYPE') == 'wayland'
 HAS_LAYER_SHELL = False
-if IS_WAYLAND:
+if IS_WAYLAND and HAS_GTK:
     try:
         gi.require_version('GtkLayerShell', '0.1')
         from gi.repository import GtkLayerShell
@@ -35,21 +42,30 @@ BASE_HEIGHTS = [
 # Colors
 BG_COLOR = (0.10, 0.10, 0.10, 0.93)
 BAR_COLOR = (0.93, 0.91, 0.85)
+ERROR_BAR_COLOR = (0.91, 0.45, 0.40)
 TEXT_COLOR = (0.80, 0.78, 0.73, 0.9)
 
 STATE_LABELS = {
     "recording": "Recording",
     "transcribing": "Transcribing",
-    "translating": "Translating",
     "editing": "Editing",
     "done": "Done",
     "silent": "No sound",
+    "error": "Failed",
 }
 
-PID_FILE = "/tmp/xhisper-notify.pid"
+RUNTIME_DIR = os.environ.get("XHISPER_RUNTIME_DIR") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "xhisper")
+try:
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+except OSError:
+    RUNTIME_DIR = "/tmp"
+PID_FILE = os.path.join(RUNTIME_DIR, "xhisper-notify.pid")
 
 
-class WavePill(Gtk.Window):
+# Base class is object when GTK is missing, so the module still imports and
+# main() can fall back to notify-send.
+class WavePill(Gtk.Window if HAS_GTK else object):
     def __init__(self, state="recording", timeout_ms=0):
         wtype = Gtk.WindowType.TOPLEVEL if (IS_WAYLAND and HAS_LAYER_SHELL) else Gtk.WindowType.POPUP
         super().__init__(type=wtype)
@@ -149,11 +165,11 @@ class WavePill(Gtk.Window):
         base = BASE_HEIGHTS[i] * self.max_bar_height
         if self.state == "recording":
             f = 0.7 + 0.3 * math.sin(t * 5 + i * 0.45)
-        elif self.state in ("transcribing", "translating", "editing"):
+        elif self.state in ("transcribing", "editing"):
             f = 0.75 + 0.15 * math.sin(t * 2.5 + i * 0.35)
         elif self.state == "done":
             f = max(0.15, 1.0 - t * 1.5)
-        elif self.state == "silent":
+        elif self.state in ("silent", "error"):
             f = 0.2 + 0.05 * math.sin(t * 1.5 + i * 0.3)
         else:
             f = 0.5
@@ -180,16 +196,17 @@ class WavePill(Gtk.Window):
         cr.set_source_rgba(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2], BG_COLOR[3] * a)
         cr.fill()
 
+        bar_color = ERROR_BAR_COLOR if self.state == "error" else BAR_COLOR
         for i in range(NUM_BARS):
             bx = self.wave_x + i * (BAR_WIDTH + BAR_GAP)
             bh = self.bar_height(i, t)
             by = cy - bh / 2
             self.rounded_rect(cr, bx, by, BAR_WIDTH, bh, BAR_RADIUS)
-            cr.set_source_rgba(BAR_COLOR[0], BAR_COLOR[1], BAR_COLOR[2], a)
+            cr.set_source_rgba(bar_color[0], bar_color[1], bar_color[2], a)
             cr.fill()
 
         dots = ""
-        if self.state in ("recording", "transcribing", "translating", "editing"):
+        if self.state in ("recording", "transcribing", "editing"):
             dots = "." * (int(t * 2) % 4)
         tx = self.wave_x + NUM_BARS * (BAR_WIDTH + BAR_GAP) + 8
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
@@ -220,7 +237,7 @@ def kill_existing():
 def main():
     if len(sys.argv) < 2:
         print("Usage: xhisper-notify <state> [--timeout MS]", file=sys.stderr)
-        print("States: recording, transcribing, translating, done, silent, hide", file=sys.stderr)
+        print("States: recording, transcribing, editing, done, silent, error, hide", file=sys.stderr)
         sys.exit(1)
 
     state = sys.argv[1]
@@ -228,18 +245,24 @@ def main():
     if "--timeout" in sys.argv:
         idx = sys.argv.index("--timeout")
         if idx + 1 < len(sys.argv):
-            timeout_ms = int(sys.argv[idx + 1])
+            try:
+                timeout_ms = int(sys.argv[idx + 1])
+            except ValueError:
+                timeout_ms = 0
 
     kill_existing()
     if state == "hide":
         return
 
-    # Wayland without layer-shell: fall back to notify-send
-    if IS_WAYLAND and not HAS_LAYER_SHELL:
+    # No GTK, or Wayland without layer-shell: fall back to notify-send
+    if not HAS_GTK or (IS_WAYLAND and not HAS_LAYER_SHELL):
         import subprocess
         label = STATE_LABELS.get(state, state)
         t = str(timeout_ms) if timeout_ms > 0 else "30000"
-        subprocess.Popen(['notify-send', '-a', 'xhisper', 'xhisper', label, '-t', t])
+        try:
+            subprocess.Popen(['notify-send', '-a', 'xhisper', 'xhisper', label, '-t', t])
+        except OSError:
+            pass
         return
 
     signal.signal(signal.SIGTERM, lambda *_: GLib.idle_add(Gtk.main_quit))
