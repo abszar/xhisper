@@ -220,6 +220,8 @@ instance_alive() {
 
 # Past every timeout the pipeline can hit, a live instance is wedged, not busy.
 stuck_after=$(( max_recording_seconds + stt_timeout + llm_timeout + 60 ))
+# Same bound for the overlay: past it, a pill on screen is a leak, not a status.
+export XHISPER_OVERLAY_MAX_SECONDS="$stuck_after"
 if [ -f "$PIDFILE" ]; then
   read -r OLD_PID OLD_START < "$PIDFILE" 2>/dev/null
   if [ -n "$OLD_PID" ] && instance_alive "$OLD_PID"; then

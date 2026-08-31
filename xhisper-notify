@@ -119,8 +119,12 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         if timeout_ms > 0:
             GLib.timeout_add(max(timeout_ms - 500, 100), self.start_close)
 
-        with open(PID_FILE, 'w') as f:
-            f.write(str(os.getpid()))
+        # Last line of defence: recording/transcribing/editing carry no timeout,
+        # so a pill whose registration went missing used to stay on screen until
+        # the next reboot. Nothing may outlive the pipeline that spawned it.
+        max_life = overlay_max_seconds()
+        if max_life > 0:
+            GLib.timeout_add_seconds(max_life, lambda: Gtk.main_quit() or False)
 
         self.show_all()
 
@@ -219,15 +223,138 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         return False
 
 
-def kill_existing():
-    if os.path.exists(PID_FILE):
+def overlay_max_seconds():
+    """Hard lifetime cap, in seconds. xhisper.sh passes the value past which it
+    considers its own pipeline wedged; 0 disables the cap."""
+    try:
+        return max(0, int(os.environ.get("XHISPER_OVERLAY_MAX_SECONDS", "900")))
+    except ValueError:
+        return 900
+
+
+def read_pid_file():
+    try:
+        with open(PID_FILE) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_pid_file():
+    try:
+        with open(PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def is_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def release_pid_file():
+    """Drop our registration — but only if it is still ours.
+
+    This used to be an unconditional unlink, which is what left pills stuck on
+    screen: an overlay that took longer to shut down than its successor took to
+    start would delete the successor's registration, and the next overlay's
+    kill_existing() then found nothing to kill.
+    """
+    if read_pid_file() == os.getpid():
         try:
-            with open(PID_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(0.05)
-        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            os.unlink(PID_FILE)
+        except OSError:
             pass
+
+
+def start_time(pid):
+    """Process start time in clock ticks, or None. Field 22 of /proc/pid/stat;
+    read past the last ')' because the comm field may contain spaces."""
+    try:
+        with open('/proc/%d/stat' % pid) as f:
+            stat = f.read()
+        return int(stat[stat.rindex(')') + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_older(pid, my_start, my_pid):
+    """True if pid was started before us. Overlays only ever supersede their
+    predecessors — killing a newer one would take down the pill that is meant
+    to replace ours."""
+    other = start_time(pid)
+    if other is None or my_start is None:
+        return pid < my_pid
+    if other != my_start:
+        return other < my_start
+    return pid < my_pid
+
+
+def running_overlays():
+    """Every live overlay process older than us, whether or not it is registered.
+
+    The PID file is a single slot and can be lost; scanning /proc cannot. We
+    match on an argv entry whose basename is exactly this program, so a shell
+    that merely mentions xhisper-notify in its command line is not a target.
+    """
+    found = []
+    if not os.path.isdir('/proc'):
+        return found
+    me = os.getpid()
+    my_start = start_time(me)
+    uid = os.getuid()
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            if os.stat('/proc/%d' % pid).st_uid != uid:
+                continue
+            with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                argv = f.read().decode('utf-8', 'replace').split('\0')
+        except OSError:
+            continue
+        if any(os.path.basename(a) == 'xhisper-notify' for a in argv if a):
+            if is_older(pid, my_start, me):
+                found.append(pid)
+    return found
+
+
+def kill_existing():
+    me = os.getpid()
+    targets = set(running_overlays())
+    recorded = read_pid_file()
+    if recorded is not None and recorded != me and is_older(recorded, start_time(me), me):
+        targets.add(recorded)
+
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    # Wait for them to actually go instead of guessing at a sleep, then insist.
+    deadline = time.time() + 0.5
+    while targets and time.time() < deadline:
+        targets = {pid for pid in targets if is_alive(pid)}
+        if targets:
+            time.sleep(0.02)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    # Clear the slot only when it points at something that is gone, so we never
+    # discard a live overlay's registration.
+    recorded = read_pid_file()
+    if recorded is not None and not is_alive(recorded):
         try:
             os.unlink(PID_FILE)
         except OSError:
@@ -267,13 +394,14 @@ def main():
 
     signal.signal(signal.SIGTERM, lambda *_: GLib.idle_add(Gtk.main_quit))
 
+    # Register before building the window: GTK setup costs about half a second,
+    # and until the PID file names us the next overlay cannot find us to kill.
+    write_pid_file()
+
     WavePill(state=state, timeout_ms=timeout_ms)
     Gtk.main()
 
-    try:
-        os.unlink(PID_FILE)
-    except OSError:
-        pass
+    release_pid_file()
 
 
 if __name__ == "__main__":
