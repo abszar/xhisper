@@ -294,12 +294,29 @@ def is_older(pid, my_start, my_pid):
     return pid < my_pid
 
 
+def is_overlay_argv(argv):
+    """True if argv is this program running, not something that names it.
+
+    The shebang turns us into `python3 /path/xhisper-notify <state>`, so the
+    program is argv[0] (direct exec) or argv[1] behind a python interpreter.
+    Matching the basename anywhere in argv also hit `vim xhisper-notify`,
+    `less`, `git diff -- xhisper-notify` or a shell script handed the path, and
+    killed them on the next dictation.
+    """
+    if not argv:
+        return False
+    prog = os.path.basename(argv[0])
+    if prog == 'xhisper-notify':
+        return True
+    return (len(argv) > 1 and prog.startswith('python')
+            and os.path.basename(argv[1]) == 'xhisper-notify')
+
+
 def running_overlays():
     """Every live overlay process older than us, whether or not it is registered.
 
-    The PID file is a single slot and can be lost; scanning /proc cannot. We
-    match on an argv entry whose basename is exactly this program, so a shell
-    that merely mentions xhisper-notify in its command line is not a target.
+    The PID file is a single slot and can be lost; scanning /proc cannot. Only
+    processes that are actually running this program are targets.
     """
     found = []
     if not os.path.isdir('/proc'):
@@ -320,7 +337,7 @@ def running_overlays():
                 argv = f.read().decode('utf-8', 'replace').split('\0')
         except OSError:
             continue
-        if any(os.path.basename(a) == 'xhisper-notify' for a in argv if a):
+        if is_overlay_argv(argv):
             if is_older(pid, my_start, me):
                 found.append(pid)
     return found
