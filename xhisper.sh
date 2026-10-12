@@ -24,13 +24,23 @@
 
 VERSION="1.4"
 OS=$(uname)
+# launchd (the hotkey agent) starts us with a bare PATH: rec, ffmpeg and jq
+# come from Homebrew.
+[ "$OS" = "Darwin" ] && PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 
 # Runtime state lives in a private directory (0700), never world-readable /tmp:
 # it holds the recording, the log of everything you dictated, and the request
 # body sent to the LLM.
-RUNTIME_DIR="${XHISPER_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/xhisper}"
+if [ "$OS" = "Darwin" ] && [ -z "$XDG_RUNTIME_DIR" ]; then
+  # macOS has no XDG_RUNTIME_DIR; the per-user temp dir is private (0700),
+  # unlike /tmp. Xhisper.app computes the same path.
+  DARWIN_TMP=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)
+  RUNTIME_DIR="${XHISPER_RUNTIME_DIR:-${DARWIN_TMP%/}/xhisper}"
+else
+  RUNTIME_DIR="${XHISPER_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/xhisper}"
+fi
 if ! mkdir -p "$RUNTIME_DIR" 2>/dev/null || [ ! -w "$RUNTIME_DIR" ]; then
   RUNTIME_DIR="$HOME/.cache/xhisper"
   mkdir -p "$RUNTIME_DIR" 2>/dev/null
@@ -153,6 +163,19 @@ else
   XHISPER_LEARN="xhisper-learn"
 fi
 
+# macOS: the overlay, history window, hotkey agent, paste and accessibility
+# reads are subcommands of Xhisper.app (macos/); xhisper-learn is shared.
+if [ "$OS" = "Darwin" ]; then
+  if [ "$LOCAL_MODE" -eq 1 ]; then
+    XHISPER_APP="$SCRIPT_DIR/build/Xhisper.app/Contents/MacOS/Xhisper"
+  else
+    XHISPER_APP="/Applications/Xhisper.app/Contents/MacOS/Xhisper"
+    XHISPER_LEARN="$(command -v xhisper-learn || echo /usr/local/bin/xhisper-learn)"
+  fi
+  export XHISPER_APP XHISPER_LEARN
+  [ "$HISTORY_MODE" -eq 1 ] && exec "$XHISPER_APP" history
+fi
+
 if [ "$HISTORY_MODE" -eq 1 ]; then
   exec "$XHISPER_HISTORY"
 fi
@@ -185,6 +208,13 @@ llm_url="https://api.groq.com/openai/v1"
 llm_api_key=""
 llm_model="qwen/qwen3.8-27b"
 llm_timeout=30
+if [ "$OS" = "Darwin" ]; then
+  # Cue sounds out of the box on the Mac. A key present in xhisperrc with an
+  # empty value still means silent.
+  start_sound="/System/Library/Sounds/Tink.aiff"
+  stop_sound="/System/Library/Sounds/Pop.aiff"
+  cancel_sound="/System/Library/Sounds/Basso.aiff"
+fi
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/xhisper"
 CONFIG_FILE="$CONFIG_DIR/xhisperrc"
@@ -263,6 +293,8 @@ instance_alive() {
   kill -0 "$1" 2>/dev/null || return 1
   if [ -r "/proc/$1/cmdline" ]; then
     tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q xhisper || return 1
+  elif [ "$OS" = "Darwin" ]; then
+    ps -p "$1" -o command= 2>/dev/null | grep -q xhisper || return 1
   fi
   return 0
 }
@@ -312,6 +344,8 @@ rotate_log() {
 now_seconds() {
   if [ -n "$EPOCHREALTIME" ]; then
     printf '%s' "${EPOCHREALTIME/,/.}"
+  elif [ "$OS" = "Darwin" ]; then
+    perl -MTime::HiRes=time -e 'printf "%.3f", time'
   else
     date +%s
   fi
@@ -377,8 +411,11 @@ paste() {
   printf '%s' "$text" | $CLIP_COPY
   sleep 0.05
   if [ "$OS" = "Darwin" ]; then
-    if [ "$is_terminal" -eq 1 ]; then
-      osascript -e 'tell application "System Events" to keystroke "v" using {command down, shift down}'
+    # Plain Cmd+V everywhere: macOS terminals paste the clipboard with it, and
+    # Cmd+Shift+V is "Paste Selection" in Terminal.app.
+    if [ -x "$XHISPER_APP" ]; then
+      "$XHISPER_APP" paste
+      [ $? -eq 2 ] && log_line "Paste: Xhisper.app lacks Accessibility (System Settings > Privacy & Security > Accessibility)"
     else
       osascript -e 'tell application "System Events" to keystroke "v" using command down'
     fi
@@ -426,18 +463,22 @@ save_history() {
 
 # Status overlay (animated wave pill, falls back to notify-send)
 show_status() {
-  if command -v "$XHISPER_NOTIFY" &> /dev/null; then
+  if [ "$OS" = "Darwin" ]; then
+    if [ -x "$XHISPER_APP" ]; then
+      "$XHISPER_APP" notify "$@" &
+    else
+      case "$1" in
+        recording)    osascript -e 'display notification "Recording..." with title "xhisper"' ;;
+        transcribing) osascript -e 'display notification "Transcribing..." with title "xhisper"' ;;
+        editing)      osascript -e 'display notification "Editing..." with title "xhisper"' ;;
+        done)         osascript -e 'display notification "Done" with title "xhisper"' ;;
+        silent)       osascript -e 'display notification "No sound detected" with title "xhisper"' ;;
+        cancelled)    osascript -e 'display notification "Cancelled" with title "xhisper"' ;;
+        error)        osascript -e 'display notification "Something went wrong" with title "xhisper"' ;;
+      esac
+    fi
+  elif command -v "$XHISPER_NOTIFY" &> /dev/null; then
     "$XHISPER_NOTIFY" "$@" &
-  elif [ "$OS" = "Darwin" ]; then
-    case "$1" in
-      recording)    osascript -e 'display notification "Recording..." with title "xhisper"' ;;
-      transcribing) osascript -e 'display notification "Transcribing..." with title "xhisper"' ;;
-      editing)      osascript -e 'display notification "Editing..." with title "xhisper"' ;;
-      done)         osascript -e 'display notification "Done" with title "xhisper"' ;;
-      silent)       osascript -e 'display notification "No sound detected" with title "xhisper"' ;;
-      cancelled)    osascript -e 'display notification "Cancelled" with title "xhisper"' ;;
-      error)        osascript -e 'display notification "Something went wrong" with title "xhisper"' ;;
-    esac
   else
     case "$1" in
       recording)    notify-send -a xhisper "xhisper" "Recording..." -t 30000 ;;
@@ -452,7 +493,9 @@ show_status() {
 }
 
 hide_status() {
-  if command -v "$XHISPER_NOTIFY" &> /dev/null; then
+  if [ "$OS" = "Darwin" ]; then
+    [ -x "$XHISPER_APP" ] && "$XHISPER_APP" notify hide 2>/dev/null
+  elif command -v "$XHISPER_NOTIFY" &> /dev/null; then
     "$XHISPER_NOTIFY" hide 2>/dev/null
   fi
 }
@@ -537,7 +580,14 @@ transcribe() {
 get_active_window() {
   local wname=""
   if [ "$OS" = "Darwin" ]; then
-    wname=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null)
+    if [ -x "$XHISPER_APP" ]; then
+      local front
+      front=$("$XHISPER_APP" front 2>/dev/null)
+      wname=$(printf '%s' "$front" | cut -f3)
+      [ -z "$wname" ] && wname=$(printf '%s' "$front" | cut -f2)
+    else
+      wname=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null)
+    fi
     printf '%s' "$wname"
     return
   fi
@@ -573,7 +623,11 @@ get_active_window() {
 }
 
 get_active_window_class() {
-  [ "$OS" = "Darwin" ] && return 0
+  if [ "$OS" = "Darwin" ]; then
+    # The bundle id (com.apple.Terminal, com.googlecode.iterm2) is the class.
+    [ -x "$XHISPER_APP" ] && "$XHISPER_APP" front 2>/dev/null | cut -f1
+    return 0
+  fi
 
   local wclass=""
   local session=${XDG_SESSION_TYPE:-x11}
@@ -837,19 +891,41 @@ def stop_requested():
 session = os.environ.get('XDG_SESSION_TYPE', 'x11')
 
 if sys.platform == 'darwin':
-    # macOS: use Quartz CGEventSource to detect key state
+    # macOS: CGEventSourceKeyState through ctypes, so no PyObjC is needed.
+    import ctypes
     try:
-        from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
-    except ImportError:
-        finish('cannot read the keyboard (Quartz missing)', 3)
+        CG = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+    except OSError:
+        finish('cannot read the keyboard (CoreGraphics missing)', 3)
+    CG.CGEventSourceKeyState.restype = ctypes.c_bool
+    CG.CGEventSourceKeyState.argtypes = [ctypes.c_int32, ctypes.c_uint16]
+    HID_STATE = 1  # kCGEventSourceStateHIDSystemState
     ESC = 53
-    def read_keys():
-        # Scan the common key range 0-127
-        return {k for k in range(128) if CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, k)}
-    def escape_pressed(keys):
-        return ESC in keys
-    def close():
+    runtime = os.environ.get('XHISPER_RUNTIME_DIR', '')
+    listening = os.path.join(runtime, 'xhisper.listening')
+    cancelflag = os.path.join(runtime, 'xhisper.cancel')
+    # While this file names us, the hotkey agent swallows Escape and drops
+    # the cancel flag instead, so the key does not also reach the focused app
+    # (it would interrupt Claude Code) - the X11 branch grabs it for the same reason.
+    try:
+        os.unlink(cancelflag)
+    except OSError:
         pass
+    try:
+        with open(listening, 'w') as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    def read_keys():
+        return {k for k in range(128) if CG.CGEventSourceKeyState(HID_STATE, k)}
+    def escape_pressed(keys):
+        return ESC in keys or os.path.exists(cancelflag)
+    def close():
+        for path in (listening, cancelflag):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 elif session != 'wayland':
     # X11: use XQueryKeymap
@@ -1023,7 +1099,7 @@ for dep in curl jq ffmpeg ffprobe awk python3; do
   command -v "$dep" &> /dev/null || MISSING="$MISSING $dep"
 done
 if [ "$OS" = "Darwin" ]; then
-  command -v rec &> /dev/null || MISSING="$MISSING rec(sox)"
+  command -v rec &> /dev/null || MISSING="$MISSING rec(brew install sox)"
 else
   command -v pw-record &> /dev/null || MISSING="$MISSING pw-record(pipewire)"
 fi
@@ -1095,7 +1171,7 @@ sleep 0.2
 
 if [ "$KEY_RC" -eq 3 ]; then
   if [ "$OS" = "Darwin" ]; then
-    fail "cannot read the keyboard — install pyobjc (pip3 install pyobjc-framework-Quartz)"
+    fail "cannot read the keyboard — CoreGraphics is unavailable (see 'xhisper --log')"
   else
     fail "cannot read the keyboard — add yourself to the 'input' group and log back in"
   fi
