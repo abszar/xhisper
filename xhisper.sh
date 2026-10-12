@@ -176,7 +176,7 @@ stt_model=""
 stt_timeout=90
 llm_url="https://api.groq.com/openai/v1"
 llm_api_key=""
-llm_model="llama-3.3-70b-versatile"
+llm_model="qwen/qwen3.8-27b"
 llm_timeout=30
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/xhisper"
