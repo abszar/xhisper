@@ -34,15 +34,15 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 
 | Feature | Linux | macOS |
 |---|---|---|
-| Hold-to-talk dictation, paste at cursor | ✅ | ✅ toggle (tap Option → Control), native Cmd+V (TextEdit verified); hold-to-talk (keep Control held) ⏳ pending a hands-on test |
+| Hold-to-talk dictation, paste at cursor | ✅ | ✅ toggle (tap Option → Control), native Cmd+V (TextEdit verified); hold-to-talk (keep Control held) ✅ (TextEdit, iTerm2) |
 | AI auto-edit, tone adaptation, answer guard | ✅ | ✅ (shared code) |
 | Personal dictionary (Whisper hints + auto-edit vocabulary) | ✅ | ✅ (shared code) |
 | `--toggle` mode, Escape to cancel, sound cues | ✅ | ✅ (toggle and Escape verified in TextEdit; the agent swallows Escape) |
 | Alt → Ctrl toggle hotkey | ✅ X11 (`xhisper-hotkey`) | ✅ Xhisper.app hotkey LaunchAgent |
 | Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ✅ native panel |
 | History window (Copy, Edit) | ✅ | ✅ native window |
-| Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit and Terminal.app; iTerm2 ⏳ pending a hands-on test (its terminal exposes text; the first test hit an iTerm update dialog). Chrome/Electron: not forced, same limit as Linux |
-| Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ⏳ pending a hands-on test |
+| Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit; Terminal.app exposes its text (read check only); iTerm2: screen context ✅, learning watcher attaches (a correction there not yet tested). Chrome/Electron: not forced, same limit as Linux |
+| Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ✅ iTerm2 (tap, hold, Escape not reaching Claude Code); Terminal.app ⏳ untested |
 
 Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.
 
