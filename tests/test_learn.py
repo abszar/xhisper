@@ -158,12 +158,13 @@ class AxReaderProtocol(unittest.TestCase):
             f.write("#!/usr/bin/env python3\nimport sys, json\n"
                     "for _ in sys.stdin:\n    print(json.dumps({'denied': True}), flush=True)\n")
         logged = []
-        old = learn.log
+        old, old_reader = learn.log, learn.open_reader
         learn.log = logged.append
+        learn.open_reader = learn.AxReader  # watch() picks AT-SPI off macOS
         try:
             learn.watch("some dictated words")
         finally:
-            learn.log = old
+            learn.log, learn.open_reader = old, old_reader
         self.assertEqual(len(logged), 1)
         self.assertIn("lacks Accessibility", logged[0])
         self.assertNotIn("dictated", logged[0])
