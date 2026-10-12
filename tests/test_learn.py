@@ -224,15 +224,41 @@ class Spacing(unittest.TestCase):
 
 
 class FakeNode:
-    def __init__(self, text, caret=-1, children=None):
+    """A text accessible. `children` maps a U+FFFC offset to its link target;
+    `kids` are the tree children focused_text_node() walks (links count too)."""
+
+    def __init__(self, text, caret=-1, children=None, role="paragraph", states=(), kids=()):
         self.text, self.caret, self.children = text, caret, children or {}
+        self.role, self.states = role, set(states)
+        self.kids = list(kids) or list(self.children.values())
 
     def get_text_iface(self):
         return self
 
+    def get_role_name(self):
+        return self.role
+
+    def get_state_set(self):
+        return type("States", (), {"contains": lambda _, s: s in self.states})()
+
+    def get_child_count(self):
+        return len(self.kids)
+
+    def get_child_at_index(self, i):
+        return self.kids[i]
+
+    def get_process_id(self):
+        return 42
+
 
 class FakeAtspi:
-    """Just the AT-SPI calls char_before_caret() makes, over FakeNode trees."""
+    """Just the AT-SPI calls focused_text_node() and char_before_caret()
+    make, over FakeNode trees. get_desktop() is set per test."""
+
+    class StateType:
+        ACTIVE, FOCUSED = "ACTIVE", "FOCUSED"
+
+    get_desktop = None
 
     class Text:
         get_caret_offset = staticmethod(lambda n: n.caret)
@@ -288,6 +314,58 @@ class AtspiCaretState(unittest.TestCase):
     def test_empty_editor(self):
         root = FakeNode(learn.OBJECT_CHAR, 0, {0: FakeNode("", 0)})
         self.assertEqual(self.state(root), "C")
+
+    def chrome(self, composer):
+        """claude.ai in Chrome as AT-SPI showed it live: the page document no
+        longer FOCUSED, the composer FOCUSED 17 levels down, and a second,
+        empty document in the same window that keeps FOCUSED."""
+        o = learn.OBJECT_CHAR
+        node = composer
+        for _ in range(16):
+            node = FakeNode(o, 0, {0: node}, role="section")
+        page = FakeNode(o * 4, 0, role="document web", kids=[node])
+        stale = FakeNode(o, -1, role="document web", states={"FOCUSED"})
+        window = FakeNode(o, 0, role="frame", states={"ACTIVE"},
+                          kids=[FakeNode(o * 4, 0, role="panel", kids=[page, stale])])
+        app = FakeNode("", -1, role="application", kids=[window])
+        return FakeNode("", -1, role="desktop", kids=[app])
+
+    def chrome_state(self, paragraph):
+        o = learn.OBJECT_CHAR
+        composer = FakeNode(o, 0, {0: paragraph}, role="entry", states={"FOCUSED"})
+        desktop = self.chrome(composer)
+        saved = learn.open_reader, learn.active_window_pid, FakeAtspi.get_desktop
+
+        class Reader(learn.AtspiReader):
+            def __init__(self):
+                self.Atspi, self.node = FakeAtspi, None
+
+        learn.open_reader, learn.active_window_pid = Reader, lambda: 42
+        FakeAtspi.get_desktop = staticmethod(lambda i: desktop)
+        try:
+            return learn.caret_state()
+        finally:
+            learn.open_reader, learn.active_window_pid, FakeAtspi.get_desktop = saved
+
+    def test_claude_ai_after_text_skips_a_stale_document(self):
+        self.assertEqual(self.chrome_state(FakeNode("finished?", 9)), "C?")
+
+    def test_claude_ai_empty_composer(self):
+        # tiptap's empty paragraph holds its trailing <br> as "\n", caret before it
+        self.assertEqual(self.chrome_state(FakeNode("\n", 0)), "C")
+
+    def test_a_focused_document_alone_is_still_found(self):
+        o = learn.OBJECT_CHAR
+        doc = FakeNode("the text goes.", 14, role="document web", states={"FOCUSED"})
+        window = FakeNode(o, 0, role="frame", states={"ACTIVE"}, kids=[doc])
+        desktop = FakeNode("", -1, role="desktop", kids=[FakeNode("", -1, role="application", kids=[window])])
+        saved = learn.active_window_pid, FakeAtspi.get_desktop
+        learn.active_window_pid = lambda: 42
+        FakeAtspi.get_desktop = staticmethod(lambda i: desktop)
+        try:
+            self.assertIs(learn.focused_text_node(FakeAtspi), doc)
+        finally:
+            learn.active_window_pid, FakeAtspi.get_desktop = saved
 
     def test_object_without_text_is_a_boundary(self):
         root = FakeNode("word " + learn.OBJECT_CHAR, 6, {5: FakeNode("", -1)})

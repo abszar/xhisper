@@ -318,16 +318,23 @@ def active_window_pid():
         return None
 
 
+DOCUMENT_ROLES = ("document web", "document frame")
+
+
 def focused_text_node(Atspi):
     """The focused accessible with a Text interface in the active window.
 
     AT-SPI's ACTIVE state is unreliable on its own (a backgrounded Chrome and
     mutter's frame windows both keep claiming it), so on X11 the app is picked
     by the PID of the window the X server says is focused. Without that, a
-    focused field that has a caret is preferred."""
+    focused field that has a caret is preferred.
+
+    Chrome leaves FOCUSED on page documents that do not hold the focus (a
+    second, empty one sits next to claude.ai's page), so a focused document
+    is only kept as a last resort while the search goes on for the field."""
     pid = active_window_pid()
     desktop = Atspi.get_desktop(0)
-    fallback = None
+    fallback, document = None, None
     for i in range(desktop.get_child_count()):
         app = desktop.get_child_at_index(i)
         if app is None:
@@ -349,7 +356,13 @@ def focused_text_node(Atspi):
                 node = stack.pop()
                 seen += 1
                 try:
-                    if node.get_state_set().contains(Atspi.StateType.FOCUSED):
+                    if node.get_state_set().contains(Atspi.StateType.FOCUSED) \
+                            and node.get_role_name() in DOCUMENT_ROLES:
+                        if node.get_text_iface() is not None and (
+                                document is None or Atspi.Text.get_caret_offset(document)
+                                < 0 <= Atspi.Text.get_caret_offset(node)):
+                            document = node
+                    elif node.get_state_set().contains(Atspi.StateType.FOCUSED):
                         if node.get_text_iface() is None:
                             break
                         if pid is not None or Atspi.Text.get_caret_offset(node) >= 0:
@@ -359,7 +372,7 @@ def focused_text_node(Atspi):
                     stack.extend(node.get_child_at_index(k) for k in range(node.get_child_count()))
                 except Exception:
                     continue
-    return fallback
+    return fallback or document
 
 
 class AtspiReader:
