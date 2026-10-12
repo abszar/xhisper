@@ -8,3 +8,4 @@ xhispertool
 xhispertoold
 test
 build/
+__pycache__/
