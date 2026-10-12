@@ -27,6 +27,9 @@ OS=$(uname)
 # launchd (the hotkey agent) starts us with a bare PATH: rec, ffmpeg and jq
 # come from Homebrew.
 [ "$OS" = "Darwin" ] && PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# ...and no LANG/LC_*: pbcopy/pbpaste then use MacRoman, so non-ASCII text
+# is pasted as mojibake and the saved clipboard comes back with '?'.
+[ "$OS" = "Darwin" ] && export LANG="${LANG:-en_US.UTF-8}"
 
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 

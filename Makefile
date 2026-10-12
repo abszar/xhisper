@@ -37,7 +37,11 @@ check: build/selftest
 	build/selftest
 	@if [ -d tests ]; then python3 -m unittest discover -s tests -v; fi
 
-install: $(APP_BIN)
+# Never builds: under sudo that would ad-hoc sign as root (TCC grants dropped,
+# root-owned build/). Build first as your user with plain `make`.
+install:
+	@if [ ! -f $(APP_BIN) ] || [ -n "$$(find $(APP_SOURCES) macos/Info.plist -newer $(APP_BIN) 2>/dev/null)" ]; then \
+	  echo "Run 'make' as your user first (signing needs your keychain)"; exit 1; fi
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 xhisper.sh $(DESTDIR)$(BINDIR)/xhisper
 	install -m 755 xhisper-learn $(DESTDIR)$(BINDIR)/xhisper-learn

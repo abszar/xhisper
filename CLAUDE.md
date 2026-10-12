@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 xhisper is used on two machines: Linux (Ubuntu, GNOME on X11 — the main one) and macOS. Each has its own Claude Code session working on this same repo, and they only meet through git. So whenever you finish a feature or a fix, on either platform, **end your final message with a section titled `Other platform (macOS)` or `Other platform (Linux)`**, giving exactly one of these verdicts:
 
-1. **Nothing to do but pull.** The change is shared code that runs the same on both (e.g. the auto-edit prompt, config parsing, history format). Say so plainly: "Works on macOS as is: `git pull && sudo make install`", plus any new config key to add to `xhisperrc`.
+1. **Nothing to do but pull.** The change is shared code that runs the same on both (e.g. the auto-edit prompt, config parsing, history format). Say so plainly: "Works on macOS as is: `git pull && make && sudo make install`" (macOS builds as the user first; `make install` refuses to build), plus any new config key to add to `xhisperrc`.
 2. **Needs work there.** The change uses something platform-specific (X11, AT-SPI, GTK, uinput, evdev / Quartz, AppKit, Accessibility API, LaunchAgents). Give a **ready-to-paste prompt** for the agent on the other machine, in a code block, covering:
    - what the feature does for the user;
    - how it is built here (files, functions, mechanism) and why;
@@ -76,7 +76,7 @@ hotkey press → xhisper.sh
   → wait_for_key_release  (polls until all keys that were held at launch are released)
   → kill recorder → silence check (ffmpeg volumedetect)
   → STT: POST multipart to {stt_url}/audio/transcriptions (Whisper)
-  → detect active window (xdotool | GNOME gdbus Eval | osascript)
+  → detect active window (xdotool | GNOME gdbus Eval | Xhisper front, osascript fallback)
   → optional LLM auto-edit: POST {llm_url}/chat/completions with tone-specific system prompt
   → save current clipboard → copy transcription → simulate paste → restore clipboard
   → show "done" overlay, exit
@@ -105,7 +105,7 @@ hotkey press → xhisper.sh
 
 A Python heredoc that auto-selects one of three backends based on `sys.platform` and `$XDG_SESSION_TYPE`:
 
-- **macOS** — `Quartz.CGEventSourceKeyState` polled over keycodes 0–127.
+- **macOS** — `CGEventSourceKeyState` (CoreGraphics via ctypes, no PyObjC) polled over keycodes 0–127.
 - **X11** — `libX11.so.6` `XQueryKeymap` (reads a 32-byte keymap bitfield).
 - **Wayland** — `ioctl(EVIOCGKEY)` on `/dev/input/event*` devices that advertise `EV_KEY` with a long-enough key capability bitmap (heuristic for "is a keyboard"). **This is why Linux users need to be in the `input` group** — the Wayland branch reads evdev directly.
 

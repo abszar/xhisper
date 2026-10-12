@@ -34,7 +34,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 
 | Feature | Linux | macOS |
 |---|---|---|
-| Hold-to-talk dictation, paste at cursor | ✅ | ✅ native Cmd+V (TextEdit verified) |
+| Hold-to-talk dictation, paste at cursor | ✅ | ✅ toggle (Option → Control), native Cmd+V (TextEdit verified); hold-to-talk ⏳ (bring your own launcher) |
 | AI auto-edit, tone adaptation, answer guard | ✅ | ✅ (shared code) |
 | Personal dictionary (Whisper hints + auto-edit vocabulary) | ✅ | ✅ (shared code) |
 | `--toggle` mode, Escape to cancel, sound cues | ✅ | ✅ (toggle and Escape verified in TextEdit; the agent swallows Escape) |
@@ -204,7 +204,7 @@ If you run from a checkout inside `~/Documents` (`xhisper.sh --local`), macOS ma
 
 ## Usage
 
-**Hold** your shortcut key to record, **release** to stop and transcribe. The transcribed text is pasted at your cursor.
+**Hold** your shortcut key to record, **release** to stop and transcribe. The transcribed text is pasted at your cursor. On macOS use the Option → Control toggle (below); hold-to-talk needs your own launcher and is untested there.
 
 To end a recording without releasing the key, run **`xhisper --stop`** — bind it
 to a second shortcut if you want a stop key. Pressing the dictation hotkey again
