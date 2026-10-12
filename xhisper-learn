@@ -62,6 +62,7 @@ RUNTIME_DIR = runtime_dir()
 WATCH_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper-learn.pid")
 XHISPER_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper.pid")
 WORD_LIST = "/usr/share/dict/words"
+OBJECT_CHAR = "￼"  # stands for an embedded paragraph or object in a browser field
 
 WATCH_SECONDS = 60
 POLL_SECONDS = 0.5
@@ -395,6 +396,33 @@ class AtspiReader:
         except Exception:
             return ""
 
+    def char_before_caret(self):
+        """The character before the caret. Browsers expose a rich editor as a
+        tree: the focused node holds one U+FFFC per paragraph, so follow the
+        link around the caret down to the node that really holds it."""
+        Text, Hypertext = self.Atspi.Text, self.Atspi.Hypertext
+        try:
+            node = self.node
+            for _ in range(8):
+                caret = Text.get_caret_offset(node)
+                count = Text.get_character_count(node)
+                child = None
+                for offset in (caret, caret - 1):
+                    if 0 <= offset < count and Text.get_text(node, offset, offset + 1) == OBJECT_CHAR:
+                        link = Hypertext.get_link(node, Hypertext.get_link_index(node, offset))
+                        obj = link.get_object(0) if link else None
+                        if obj is not None and obj.get_text_iface() is not None \
+                                and Text.get_caret_offset(obj) >= 0:
+                            child = obj
+                            break
+                if child is None:
+                    break
+                node = child
+            caret = Text.get_caret_offset(node)
+            return Text.get_text(node, caret - 1, caret) if caret > 0 else ""
+        except Exception:
+            return ""
+
     def is_empty(self):
         try:
             return self.Atspi.Text.get_character_count(self.node) == 0
@@ -451,6 +479,9 @@ class AxReader:
         text, caret = self.first.get("text", ""), self.first.get("caret", -1)
         end = caret if 0 <= caret <= len(text) else len(text)
         return text[max(0, end - limit):end]
+
+    def char_before_caret(self):
+        return self.before_caret(1)
 
     def is_empty(self):
         return self.first.get("text", "") == ""
@@ -649,7 +680,12 @@ def caret_state():
     try:
         if not reader.attach():
             return "U"
-        return "E" if reader.is_empty() else "C" + reader.before_caret(1)
+        if reader.is_empty():
+            return "E"
+        before = reader.char_before_caret()
+        # Still a placeholder: right after a paragraph or other block, so the
+        # caret starts a line. No space, as at the start of a field.
+        return "C" + ("" if before == OBJECT_CHAR else before)
     finally:
         reader.close()
 

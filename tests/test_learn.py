@@ -223,6 +223,77 @@ class Spacing(unittest.TestCase):
             self.assertFalse(learn.needs_space(before, text), repr((before, text)))
 
 
+class FakeNode:
+    def __init__(self, text, caret=-1, children=None):
+        self.text, self.caret, self.children = text, caret, children or {}
+
+    def get_text_iface(self):
+        return self
+
+
+class FakeAtspi:
+    """Just the AT-SPI calls char_before_caret() makes, over FakeNode trees."""
+
+    class Text:
+        get_caret_offset = staticmethod(lambda n: n.caret)
+        get_character_count = staticmethod(lambda n: len(n.text))
+        get_text = staticmethod(lambda n, start, end: n.text[start:end])
+
+    class Hypertext:
+        get_link_index = staticmethod(lambda n, offset: offset)
+
+        @staticmethod
+        def get_link(n, index):
+            child = n.children.get(index)
+            return type("Link", (), {"get_object": lambda self, i: child})() if child else None
+
+
+class AtspiCaretState(unittest.TestCase):
+    """The character before the caret through AT-SPI, browser rich editors
+    included (runs on any OS: the tree is faked, open_reader is patched)."""
+
+    def state(self, root):
+        class Reader(learn.AtspiReader):
+            def __init__(self):
+                self.Atspi, self.node = FakeAtspi, None
+
+            def attach(self):
+                self.node = root
+                return True
+
+        saved = learn.open_reader
+        learn.open_reader = Reader
+        try:
+            return learn.caret_state()
+        finally:
+            learn.open_reader = saved
+
+    def editor(self, caret, second, second_caret):
+        """Chrome's contenteditable: one U+FFFC per paragraph in the focused node."""
+        o = learn.OBJECT_CHAR
+        return FakeNode(o + o, caret, {0: FakeNode("First line."), 1: FakeNode(second, second_caret)})
+
+    def test_plain_field(self):
+        self.assertEqual(self.state(FakeNode("the text goes.", 14)), "C.")
+
+    def test_empty_new_paragraph(self):
+        self.assertEqual(self.state(self.editor(1, "", 0)), "C")
+
+    def test_after_text_in_a_paragraph(self):
+        self.assertEqual(self.state(self.editor(1, "job finished?", 13)), "C?")
+
+    def test_caret_reported_after_the_placeholder(self):
+        self.assertEqual(self.state(self.editor(2, "job finished?", 13)), "C?")
+
+    def test_empty_editor(self):
+        root = FakeNode(learn.OBJECT_CHAR, 0, {0: FakeNode("", 0)})
+        self.assertEqual(self.state(root), "C")
+
+    def test_object_without_text_is_a_boundary(self):
+        root = FakeNode("word " + learn.OBJECT_CHAR, 6, {5: FakeNode("", -1)})
+        self.assertEqual(self.state(root), "C")
+
+
 class PasteTimeDifferences(unittest.TestCase):
     """Only edits made after the paste are learned, not how it landed."""
 
