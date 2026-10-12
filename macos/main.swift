@@ -25,7 +25,7 @@ func notBuiltYet() -> Int32 {
 switch subcommand {
 case "notify": exit(Overlay.main(rest))
 case "history": exit(HistoryApp.main(rest))
-case "hotkey": exit(notBuiltYet())
+case "hotkey": exit(Hotkey.main(rest))
 case "ax": exit(notBuiltYet())
 case "front": exit(AXCommand.front())
 case "paste": exit(Paste.main(rest))

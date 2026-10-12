@@ -11,7 +11,7 @@ ifeq ($(UNAME),Darwin)
 APP = build/Xhisper.app
 APP_BIN = $(APP)/Contents/MacOS/Xhisper
 APP_SOURCES = $(wildcard macos/*.swift)
-LOGIC_SOURCES = macos/Runtime.swift macos/LevelMeter.swift macos/HistoryStore.swift
+LOGIC_SOURCES = macos/Runtime.swift macos/LevelMeter.swift macos/HistoryStore.swift macos/HotkeyLogic.swift
 SWIFTFLAGS = -O -swift-version 5 -target $(shell uname -m)-apple-macos13.0
 # A stable signature keeps the Accessibility / Input Monitoring grants across
 # rebuilds; ad-hoc (-) changes identity each time. See macos/make-cert.sh.
@@ -41,14 +41,20 @@ install: $(APP_BIN)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 xhisper.sh $(DESTDIR)$(BINDIR)/xhisper
 	install -m 755 xhisper-learn $(DESTDIR)$(BINDIR)/xhisper-learn
+	-launchctl bootout gui/$$(id -u $(INSTALL_USER))/$(AGENT) 2>/dev/null
 	rm -rf $(APPLICATIONS)/Xhisper.app
 	ditto $(APP) $(APPLICATIONS)/Xhisper.app
 	for sub in notify history hotkey; do \
 	  printf '#!/bin/sh\nexec /Applications/Xhisper.app/Contents/MacOS/Xhisper %s "$$@"\n' $$sub > $(DESTDIR)$(BINDIR)/xhisper-$$sub; \
 	  chmod 755 $(DESTDIR)$(BINDIR)/xhisper-$$sub; \
 	done
+	install -d -o $(INSTALL_USER) $(INSTALL_HOME)/Library/LaunchAgents
+	install -m 644 -o $(INSTALL_USER) macos/$(AGENT).plist $(INSTALL_HOME)/Library/LaunchAgents/$(AGENT).plist
+	launchctl bootstrap gui/$$(id -u $(INSTALL_USER)) $(INSTALL_HOME)/Library/LaunchAgents/$(AGENT).plist
 
 uninstall:
+	-launchctl bootout gui/$$(id -u $(INSTALL_USER))/$(AGENT) 2>/dev/null
+	rm -f $(INSTALL_HOME)/Library/LaunchAgents/$(AGENT).plist
 	rm -rf $(APPLICATIONS)/Xhisper.app
 	rm -f $(DESTDIR)$(BINDIR)/xhisper $(DESTDIR)$(BINDIR)/xhisper-learn
 	rm -f $(DESTDIR)$(BINDIR)/xhisper-notify $(DESTDIR)$(BINDIR)/xhisper-history $(DESTDIR)$(BINDIR)/xhisper-hotkey
