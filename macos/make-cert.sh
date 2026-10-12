@@ -26,9 +26,11 @@ keyUsage = critical,digitalSignature
 extendedKeyUsage = critical,codeSigning
 EOF
 
-openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 -config "$work/cert.cnf" \
+# /usr/bin/openssl (LibreSSL) on purpose: Homebrew's OpenSSL 3 writes PKCS#12
+# files that `security import` rejects ("MAC verification failed").
+/usr/bin/openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 -config "$work/cert.cnf" \
   -keyout "$work/key.pem" -out "$work/cert.pem" || exit 1
-openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -name "$NAME" \
+/usr/bin/openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -name "$NAME" \
   -passout pass:xhisper -out "$work/id.p12" || exit 1
 security import "$work/id.p12" -k "$KEYCHAIN" -P xhisper -T /usr/bin/codesign || exit 1
 security add-trusted-cert -p codeSign -k "$KEYCHAIN" "$work/cert.pem" || exit 1
