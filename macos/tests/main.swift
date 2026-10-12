@@ -53,6 +53,31 @@ check(readTailDB(path: wav) == nil, "too short a WAV gives no level yet")
 check(readTailDB(path: wav + ".missing") == nil, "missing WAV gives no level")
 try? FileManager.default.removeItem(atPath: wav)
 
+// --- HistoryStore ---
+var utc = Calendar(identifier: .gregorian); utc.timeZone = TimeZone(identifier: "UTC")!
+let noon = ISO8601DateFormatter().date(from: "2026-10-12T18:00:00Z")!
+check(HistoryStore.describe("2026-10-12T14:03:05+0000", now: noon, calendar: utc) == "Today 14:03", "today label")
+check(HistoryStore.describe("2026-10-11T09:00:00+0000", now: noon, calendar: utc) == "Yesterday 09:00", "yesterday label")
+check(HistoryStore.describe("2026-10-01T08:05:00+0000", now: noon, calendar: utc) == "01 Oct 08:05", "older label")
+check(HistoryStore.describe("garbage", now: noon, calendar: utc) == "garbage", "bad stamp shown as is")
+check(HistoryStore.defaultPath(env: ["XHISPER_HISTORY_FILE": "/x/h.jsonl"]) == "/x/h.jsonl", "history path from env")
+check(HistoryStore.defaultPath(env: ["XDG_STATE_HOME": "/s"]) == "/s/xhisper/history.jsonl", "history path from XDG_STATE_HOME")
+let hist = NSTemporaryDirectory() + "xhisper-selftest-\(getpid()).jsonl"
+check(HistoryStore.load(hist).isEmpty, "missing history file is empty")
+let lines = ["{\"time\":\"t1\",\"text\":\"first one\"}", "not json", "{\"time\":\"t2\",\"text\":\"\"}", "{\"time\":\"t3\",\"text\":\"third\"}", ""]
+try? lines.joined(separator: "\n").write(toFile: hist, atomically: true, encoding: .utf8)
+let loaded = HistoryStore.load(hist)
+check(loaded == [HistoryEntry(time: "t3", text: "third"), HistoryEntry(time: "t1", text: "first one")], "load: newest first, bad lines skipped")
+check(HistoryStore.update(hist, entry: loaded[1], newText: "fixed \"quoted\" é/x"), "update an entry")
+let after = (try? String(contentsOfFile: hist, encoding: .utf8)) ?? ""
+check(after.contains("not json\n"), "other lines kept verbatim")
+check(HistoryStore.load(hist).last == HistoryEntry(time: "t1", text: "fixed \"quoted\" é/x"), "updated text round-trips")
+var hs = stat(); stat(hist, &hs)
+check((hs.st_mode & 0o777) == 0o600, "history stays 0600")
+check(!FileManager.default.fileExists(atPath: hist + ".tmp"), "no temp file left")
+check(!HistoryStore.update(hist, entry: HistoryEntry(time: "nope", text: "x"), newText: "y"), "unknown entry not updated")
+try? FileManager.default.removeItem(atPath: hist)
+
 try? FileManager.default.removeItem(atPath: tmpRoot)
 print(failures == 0 ? "selftest: all passed" : "selftest: \(failures) failed")
 exit(failures == 0 ? 0 : 1)

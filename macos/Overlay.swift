@@ -22,14 +22,8 @@ private let stateLabels = ["recording": "Recording", "transcribing": "Transcribi
 private let historyStates: Set<String> = ["recording", "silent"]
 private let env = ProcessInfo.processInfo.environment
 
-private func historyPath() -> String {
-    if let p = env["XHISPER_HISTORY_FILE"], !p.isEmpty { return p }
-    let state = env["XDG_STATE_HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? (NSHomeDirectory() + "/.local/state")
-    return state + "/xhisper/history.jsonl"
-}
-
 private func hasHistory() -> Bool {
-    ((try? FileManager.default.attributesOfItem(atPath: historyPath())[.size] as? Int) ?? 0) > 0
+    ((try? FileManager.default.attributesOfItem(atPath: HistoryStore.defaultPath())[.size] as? Int) ?? 0) > 0
 }
 
 private func learnCommand() -> String {
