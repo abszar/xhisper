@@ -52,6 +52,11 @@ learn-words              : false
 # is visible. That text goes to the LLM provider along with the dictation.
 screen-context           : false
 
+# Smart spacing: when the cursor sits right after a word or a full stop, the
+# dictation is pasted with a leading space ("goes." + "Ok" stays "goes. Ok").
+# Reads only the one character before the cursor (AT-SPI / Accessibility API).
+smart-spacing            : true
+
 # Silence Detection:
 # Recordings whose peak volume stays under this many dB are discarded.
 silence-threshold        : -50

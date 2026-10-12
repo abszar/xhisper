@@ -206,3 +206,56 @@ class RuntimeDir(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Spacing(unittest.TestCase):
+    """A dictation pasted right after a word gets one leading space."""
+
+    def test_after_word_or_punctuation(self):
+        for before in ("s", ".", "!", "9", ")", "é"):
+            self.assertTrue(learn.needs_space(before, "Ok, now"), repr(before))
+
+    def test_no_space(self):
+        cases = [(" ", "Ok"), ("\n", "Ok"), ("\t", "Ok"), ("", "Ok"), ("(", "Ok"), ("[", "Ok"),
+                 ('"', "Ok"), ("'", "Ok"), ("“", "Ok"), ("/", "Ok"),
+                 ("s", ", and"), ("s", "."), ("s", "?"), ("s", ")"), ("s", " Ok"), ("s", "")]
+        for before, text in cases:
+            self.assertFalse(learn.needs_space(before, text), repr((before, text)))
+
+
+class PasteTimeDifferences(unittest.TestCase):
+    """Only edits made after the paste are learned, not how it landed."""
+
+    class FakeReader:
+        def __init__(self, texts):
+            self.texts = list(texts)
+
+        def read(self):
+            text = self.texts.pop(0) if len(self.texts) > 1 else self.texts[0]
+            return text, len(text)
+
+    def setUp(self):
+        self.saved = {k: getattr(learn, k) for k in
+                      ("POLL_SECONDS", "SETTLE_SECONDS", "WATCH_SECONDS", "add_words", "announce", "log")}
+        learn.POLL_SECONDS, learn.SETTLE_SECONDS, learn.WATCH_SECONDS = 0.005, 0.03, 0.4
+        self.learned = []
+        learn.add_words = lambda words: self.learned.extend(words) or list(words)
+        learn.announce = lambda words: None
+        learn.log = lambda message: None
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(learn, k, v)
+
+    def test_glued_paste_not_learned(self):
+        dictation = "Ok, now I'm trying the push to talk."
+        reader = self.FakeReader(["Trying the tool to see if the text goes.Ok, now I'm trying the push to talk."])
+        learn.follow(reader, learn.tokenize(dictation))
+        self.assertEqual(self.learned, [])
+
+    def test_later_fix_still_learned(self):
+        dictation = "Ok, now I'm trying the push to talk."
+        reader = self.FakeReader(["goes. Ok, now I'm trying the push to talk.",
+                                  "goes. Ok, now I'm trying the ZORBIX to talk."])
+        learn.follow(reader, learn.tokenize(dictation))
+        self.assertEqual(self.learned, ["ZORBIX"])

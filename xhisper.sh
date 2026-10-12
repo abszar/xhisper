@@ -58,6 +58,7 @@ PIDFILE="$RUNTIME_DIR/xhisper.pid"
 STOPFILE="$RUNTIME_DIR/xhisper.stop"
 HISTORYFLAG="$RUNTIME_DIR/xhisper.history"
 CONTEXT_FILE="$RUNTIME_DIR/screen-context.txt"
+BEFORE_FILE="$RUNTIME_DIR/caret-before.txt"
 LLM_REQUEST="$RUNTIME_DIR/llm-request.json"
 export XHISPER_STOPFILE="$STOPFILE"
 # Written by the overlay when its History button is clicked mid-recording:
@@ -203,6 +204,7 @@ cancel_sound=""
 history_size=20
 learn_words="false"
 screen_context="false"
+smart_spacing="true"
 stt_url="https://api.groq.com/openai/v1"
 stt_api_key=""
 stt_model=""
@@ -259,6 +261,7 @@ if [ -f "$CONFIG_FILE" ]; then
       history-size) history_size="$value" ;;
       learn-words) learn_words="$value" ;;
       screen-context) screen_context="$value" ;;
+      smart-spacing) smart_spacing="$value" ;;
       stt-url) stt_url="$value" ;;
       stt-api-key) stt_api_key="$value" ;;
       stt-model) stt_model="$value" ;;
@@ -1083,7 +1086,7 @@ cleanup() {
   # Terminal overlays (done/silent/error) are meant to stay on screen after we
   # exit, so only hide the ones that would otherwise linger forever.
   [ "$FINAL_OVERLAY" -eq 0 ] && hide_status
-  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$HISTORYFLAG" "$LLM_REQUEST" "$CONTEXT_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
+  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$HISTORYFLAG" "$LLM_REQUEST" "$CONTEXT_FILE" "$BEFORE_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
   if [ -n "$SAVED_CLIPBOARD" ]; then
     printf '%s' "$SAVED_CLIPBOARD" | $CLIP_COPY
   fi
@@ -1210,6 +1213,18 @@ if [ "$screen_context" = "true" ] && [ "$auto_edit" = "true" ] \
   CONTEXT_PID=$!
 fi
 
+# Smart spacing: read the character before the cursor now, in the background
+# too, so a dictation pasted right after a word gets a leading space.
+BEFORE_PID=""
+if [ "$smart_spacing" = "true" ] && command -v "$XHISPER_LEARN" > /dev/null; then
+  if [ "$OS" = "Darwin" ]; then
+    "$XHISPER_LEARN" before < /dev/null > "$BEFORE_FILE" 2>/dev/null &
+  else
+    timeout 2 "$XHISPER_LEARN" before < /dev/null > "$BEFORE_FILE" 2>/dev/null &
+  fi
+  BEFORE_PID=$!
+fi
+
 # Save clipboard for paste phase
 SAVED_CLIPBOARD=$($CLIP_PASTE 2>/dev/null)
 
@@ -1276,7 +1291,17 @@ if [ "$OS" != "Darwin" ]; then
 fi
 
 save_history "$TRANSCRIPTION"
-paste "$TRANSCRIPTION" "$IS_TERMINAL"
+PASTE_TEXT="$TRANSCRIPTION"
+if [ -n "$BEFORE_PID" ]; then
+  wait "$BEFORE_PID" 2>/dev/null
+  if [ "$(printf '%s\0%s' "$(cat "$BEFORE_FILE" 2>/dev/null)" "$TRANSCRIPTION" \
+          | "$XHISPER_LEARN" spacing 2>/dev/null)" = "space" ]; then
+    PASTE_TEXT=" $TRANSCRIPTION"
+    log_line "Smart spacing: added a leading space"
+  fi
+  rm -f "$BEFORE_FILE"
+fi
+paste "$PASTE_TEXT" "$IS_TERMINAL"
 
 # Watch the field for a minute and learn the words the user corrects in it.
 # The text goes over stdin, never argv, so it stays out of `ps`.

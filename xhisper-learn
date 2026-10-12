@@ -16,6 +16,9 @@ Whisper as spelling hints and to the auto-edit model as vocabulary.
                                 a minute and learns the words you correct in it
   xhisper-learn context         print the text just before the cursor in the
                                 focused field (screen-context for auto-edit)
+  xhisper-learn before          print the one character before the cursor
+  xhisper-learn spacing         stdin "CHAR\0TEXT": prints "space" when TEXT
+                                pasted after CHAR needs a leading space
 
 A word is learned only when it *replaces* dictated words (typing more text is
 not a correction) and is not an ordinary English word. Lowercase words must
@@ -540,7 +543,7 @@ def watch(pasted):
 
 def follow(reader, target):
     pending, since, seen, done = [], 0.0, 0, set()
-    located = False
+    located, first_find = False, True
     deadline = time.time() + WATCH_SECONDS
     while time.time() < deadline:
         time.sleep(POLL_SECONDS)
@@ -571,6 +574,11 @@ def follow(reader, target):
         if not located:
             log("found the dictation in the field")
             located = True
+            if first_find:
+                # What already differs on the first look is how the paste
+                # landed (glued to the word before it: "goes.Ok"), not a fix.
+                first_find = False
+                done.update(corrections(target, region))
         found = [w for w in corrections(target, region) if w not in done]
         if found != pending:
             pending, since, seen = found, time.time(), 1
@@ -607,6 +615,30 @@ def context():
     text = re.sub(r"[ \t\xa0]+", " ", text)
     text = re.sub(r"\s*\n\s*", "\n", text).strip()
     return text[-CONTEXT_CHARS:]
+
+
+# A dictation pasted right after a word gets a leading space ("goes." + "Ok"
+# must not become "goes.Ok"), except after whitespace or an opening bracket or
+# quote, and never before text that starts with punctuation.
+NO_SPACE_AFTER = "([{\"'\u201c\u2018\u00ab\u00bf\u00a1/"
+NO_SPACE_BEFORE = ".,;:!?)]}\u201d\u2019\u00bb%\u2026"
+
+
+def needs_space(before, text):
+    return (bool(before) and bool(text) and not before.isspace() and before not in NO_SPACE_AFTER
+            and not text[0].isspace() and text[0] not in NO_SPACE_BEFORE)
+
+
+def char_before_caret():
+    """The one character before the caret in the focused field, or nothing."""
+    try:
+        reader = open_reader()
+    except (ImportError, ValueError):
+        return ""
+    try:
+        return reader.before_caret(1) if reader.attach() else ""
+    finally:
+        reader.close()
 
 
 def claim_watch_slot():
@@ -653,12 +685,16 @@ def main():
         learned = add_words(corrections(tokenize(data.get("old", "")), tokenize(data.get("new", ""))))
         for w in learned:
             print(w)
-    elif cmd == "context":
+    elif cmd in ("context", "before"):
         if sys.platform == "darwin":
             # No `timeout` binary on macOS: never hold up a dictation over 2 s.
             signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
             signal.alarm(2)
-        sys.stdout.write(context())
+        sys.stdout.write(context() if cmd == "context" else char_before_caret())
+    elif cmd == "spacing":
+        # stdin: the character before the caret, NUL, the dictation.
+        before, _, text = sys.stdin.buffer.read().decode("utf-8", "replace").partition("\0")
+        sys.stdout.write("space" if needs_space(before, text) else "")
     elif cmd == "watch":
         pasted = sys.stdin.read()
         claim_watch_slot()

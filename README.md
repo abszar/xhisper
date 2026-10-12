@@ -24,6 +24,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 - **Multi-language transcription** — Whisper auto-detects the spoken language by default, so you can switch between English, French, Spanish, etc. and each is transcribed in its own script. Set `language : en` (or any ISO 639-1 code) in the config to force a specific language
 - **Stability** — PID-file based concurrency control prevents duplicate instances from interfering with each other. Recordings are capped by `max-recording-seconds`, and every network call has a timeout
 - **Custom STT/LLM endpoints** — Use Groq's API by default, or point to any OpenAI-compatible endpoint — local Whisper servers, Ollama, vLLM, or any other provider
+- **Smart spacing** — A dictation pasted right after a word or a full stop gets a leading space, so two dictations in a row never glue together ("goes.Ok"). Only the one character before the cursor is read; `smart-spacing : false` turns it off
 - **Clipboard preservation** — Your clipboard content is saved before transcription and restored after pasting
 - **Clipboard manager cleanup** — Automatically removes xhisper's temporary clipboard entries from CopyQ history
 - **Private by default** — The recording, the log of everything you dictated, and the request sent to the LLM live in a 0700 directory under `$XDG_RUNTIME_DIR`, never in world-readable `/tmp`. API keys are handed to `curl` over stdin so they never appear in `ps`
