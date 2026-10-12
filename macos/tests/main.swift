@@ -32,6 +32,27 @@ check(scalarOffset(mixed, utf16: 8) == 7, "caret after emoji: utf16 8 -> scalar 
 check(scalarOffset(mixed, utf16: 999) == mixed.unicodeScalars.count, "caret clamped to end")
 check(scalarOffset(mixed, utf16: -1) == -1, "no caret stays -1")
 
+// --- LevelMeter ---
+check(abs((rmsDB(Data(count: 3200)) ?? 0) - (-90.309)) < 0.01, "silence is -90.3 dBFS")
+var half = Data(); for _ in 0..<1600 { var s = Int16(16384).littleEndian; half.append(Data(bytes: &s, count: 2)) }
+check(abs((rmsDB(half) ?? 0) - (-6.0206)) < 0.01, "half scale is -6 dBFS")
+check(rmsDB(Data()) == nil, "no samples, no level")
+var meter = LevelMeter(bars: 17)
+for _ in 0..<30 { meter.push(db: -60) }
+check(meter.levels.allSatisfy { $0 < 0.01 }, "room noise stays flat")
+for _ in 0..<5 { meter.push(db: -20) }
+check(meter.level > 0.5, "speech fills the pill")
+for _ in 0..<40 { meter.push(db: -60) }
+check(meter.level < 0.1, "pause settles")
+check(meter.levels.count == 17, "bar count fixed")
+let wav = NSTemporaryDirectory() + "xhisper-selftest-\(getpid()).wav"
+FileManager.default.createFile(atPath: wav, contents: Data(count: 44 + 3200))
+check(abs((readTailDB(path: wav) ?? 0) - (-90.309)) < 0.01, "reads the WAV tail")
+FileManager.default.createFile(atPath: wav, contents: Data(count: 100))
+check(readTailDB(path: wav) == nil, "too short a WAV gives no level yet")
+check(readTailDB(path: wav + ".missing") == nil, "missing WAV gives no level")
+try? FileManager.default.removeItem(atPath: wav)
+
 try? FileManager.default.removeItem(atPath: tmpRoot)
 print(failures == 0 ? "selftest: all passed" : "selftest: \(failures) failed")
 exit(failures == 0 ? 0 : 1)

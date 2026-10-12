@@ -11,7 +11,7 @@ ifeq ($(UNAME),Darwin)
 APP = build/Xhisper.app
 APP_BIN = $(APP)/Contents/MacOS/Xhisper
 APP_SOURCES = $(wildcard macos/*.swift)
-LOGIC_SOURCES = macos/Runtime.swift
+LOGIC_SOURCES = macos/Runtime.swift macos/LevelMeter.swift
 SWIFTFLAGS = -O -swift-version 5 -target $(shell uname -m)-apple-macos13.0
 # A stable signature keeps the Accessibility / Input Monitoring grants across
 # rebuilds; ad-hoc (-) changes identity each time. See macos/make-cert.sh.
