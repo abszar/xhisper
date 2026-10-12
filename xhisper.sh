@@ -6,6 +6,9 @@
 # `xhisper --stop` ends a live recording (bind it to a second key if you want
 # a stop shortcut). A duplicate invocation of the hotkey itself is ignored,
 # because holding a key auto-repeats and the desktop relaunches on every repeat.
+# `xhisper --toggle` is the press-once mode: it records until the next
+# `--toggle`. Only use it from a trigger that fires once per press
+# (xhisper-hotkey), never from a plain desktop shortcut.
 
 # Requirements (Linux):
 # - pipewire, pipewire-utils (audio)
@@ -54,6 +57,8 @@ Options:
   --local     Use the binaries next to this script instead of the installed ones
   --log       Print the log ($LOGFILE) and exit
   --stop      Stop a recording that is currently running and exit
+  --toggle    Press-once mode: record until the next --toggle (no holding).
+              Needs a trigger that fires once per press, like xhisper-hotkey
   --help      Show this help and exit
   --version   Print the version and exit
 
@@ -67,6 +72,7 @@ EOF
 
 # Parse command-line arguments
 LOCAL_MODE=0
+TOGGLE_MODE=0
 WRAP_KEY=""
 for arg in "$@"; do
   case "$arg" in
@@ -84,6 +90,9 @@ for arg in "$@"; do
     --stop)
       touch "$STOPFILE"
       exit 0
+      ;;
+    --toggle)
+      TOGGLE_MODE=1
       ;;
     --help|-h)
       usage
@@ -134,6 +143,7 @@ auto_edit="true"
 tone_adaptation="true"
 language=""
 max_recording_seconds=300
+start_sound=""
 stt_url="https://api.groq.com/openai/v1"
 stt_api_key=""
 stt_model=""
@@ -177,6 +187,7 @@ if [ -f "$CONFIG_FILE" ]; then
       tone-adaptation) tone_adaptation="$value" ;;
       language) language="$value" ;;
       max-recording-seconds) max_recording_seconds="$value" ;;
+      start-sound) start_sound="$value" ;;
       stt-url) stt_url="$value" ;;
       stt-api-key) stt_api_key="$value" ;;
       stt-model) stt_model="$value" ;;
@@ -228,6 +239,9 @@ if [ -f "$PIDFILE" ]; then
     OLD_AGE=0
     [ -n "$OLD_START" ] && OLD_AGE=$(( $(date +%s) - OLD_START ))
     if [ "$OLD_AGE" -lt "$stuck_after" ] 2>/dev/null; then
+      # In toggle mode the next press is the stop. Harmless if that instance is
+      # already transcribing: cleanup() removes the flag.
+      [ "$TOGGLE_MODE" -eq 1 ] && touch "$STOPFILE"
       exit 0
     fi
     kill "$OLD_PID" 2>/dev/null
@@ -660,7 +674,7 @@ auto_edit_text() {
 # push-to-talk misbehaves) and sets KEY_REASON.
 # Exit codes: 0 = released (or nothing was held), 3 = cannot read the keyboard.
 wait_for_key_release() {
-  KEY_REASON=$(XHISPER_MAX_SECONDS="$max_recording_seconds" python3 << 'PYEOF'
+  KEY_REASON=$(XHISPER_MAX_SECONDS="$max_recording_seconds" XHISPER_TOGGLE="$TOGGLE_MODE" python3 << 'PYEOF'
 import os, sys, time
 
 stopfile = os.environ.get('XHISPER_STOPFILE')
@@ -680,8 +694,16 @@ def stop_requested():
     if deadline and time.time() > deadline:
         return 'max-recording-seconds reached'
     if stopfile and os.path.exists(stopfile):
-        return 'stop requested (xhisper --stop)'
+        return 'stop requested (xhisper --stop or --toggle)'
     return None
+
+if os.environ.get('XHISPER_TOGGLE') == '1':
+    # Press-once mode: no key is held, so only a stop or the cap ends it.
+    while True:
+        time.sleep(0.05)
+        reason = stop_requested()
+        if reason:
+            finish(reason)
 
 if sys.platform == 'darwin':
     # macOS: use Quartz CGEventSource to detect key state
@@ -887,6 +909,18 @@ show_status recording
 
 # Small delay to let the DE finish processing the shortcut key
 sleep 0.15
+
+# Audible cue that recording starts. Detached and fully redirected so it never
+# delays capture or holds this script's stdout open.
+if [ -n "$start_sound" ] && [ -f "$start_sound" ]; then
+  if [ "$OS" = "Darwin" ]; then
+    afplay "$start_sound" < /dev/null > /dev/null 2>&1 &
+  elif command -v paplay > /dev/null; then
+    paplay "$start_sound" < /dev/null > /dev/null 2>&1 &
+  else
+    pw-play "$start_sound" < /dev/null > /dev/null 2>&1 &
+  fi
+fi
 
 # Start recording in background
 rm -f "$RECORDING"

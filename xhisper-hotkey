@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+
+# xhisper-hotkey - modifier-only dictation trigger (X11)
+# Press Alt, then Ctrl, to start recording; press Alt then Ctrl again to stop.
+# Each press runs `xhisper --toggle`.
+#
+# GNOME custom shortcuts need a non-modifier key, so "Alt then Ctrl" cannot be
+# bound there. This listener asks the X server for a passive grab on Control_L
+# and Control_R *with Alt (Mod1) already down*, so the server enforces the
+# order itself: Ctrl then Alt never matches, and plain Ctrl is untouched.
+# When another client holds the keyboard (Deskflow while the cursor is on the
+# other machine, a game, a lock screen) the grab cannot fire, which is what
+# we want.
+#
+# Started at login from ~/.config/autostart/xhisper-hotkey.desktop.
+# Only one instance runs per session (flock on the runtime dir).
+
+import ctypes
+import fcntl
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from ctypes import c_char, c_char_p, c_int, c_uint, c_ulong, c_void_p
+
+XK_CONTROL_L = 0xffe3
+XK_CONTROL_R = 0xffe4
+LOCK_MASK = 1 << 1   # Caps Lock
+MOD1_MASK = 1 << 3   # Alt
+MOD2_MASK = 1 << 4   # Num Lock
+KEY_PRESS = 2
+GRAB_MODE_ASYNC = 1
+CURRENT_TIME = 0
+
+
+def fail(msg):
+    print(f"xhisper-hotkey: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def single_instance():
+    runtime = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
+    lock = open(os.path.join(runtime, 'xhisper-hotkey.lock'), 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)  # already running in this session
+    return lock
+
+
+def main():
+    if os.environ.get('XDG_SESSION_TYPE') == 'wayland':
+        fail("Wayland is not supported; bind xhisper in your desktop's shortcut settings instead")
+
+    xhisper = os.environ.get('XHISPER_CMD') or shutil.which('xhisper') or '/usr/local/bin/xhisper'
+    _lock = single_instance()
+
+    try:
+        X11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+    except OSError:
+        fail("libX11 missing")
+    X11.XOpenDisplay.restype = c_void_p
+    X11.XOpenDisplay.argtypes = [c_char_p]
+    X11.XDefaultRootWindow.restype = c_ulong
+    X11.XDefaultRootWindow.argtypes = [c_void_p]
+    X11.XKeysymToKeycode.restype = ctypes.c_ubyte
+    X11.XKeysymToKeycode.argtypes = [c_void_p, c_ulong]
+    X11.XGrabKey.argtypes = [c_void_p, c_int, c_uint, c_ulong, c_int, c_int, c_int]
+    X11.XUngrabKeyboard.argtypes = [c_void_p, c_ulong]
+    X11.XNextEvent.argtypes = [c_void_p, c_void_p]
+    X11.XPending.argtypes = [c_void_p]
+    X11.XQueryKeymap.argtypes = [c_void_p, c_void_p]
+    X11.XSync.argtypes = [c_void_p, c_int]
+    X11.XFlush.argtypes = [c_void_p]
+
+    # A grab that someone else already holds fails with BadAccess, reported
+    # asynchronously; record it instead of letting Xlib exit the process.
+    grab_errors = []
+    handler_type = ctypes.CFUNCTYPE(c_int, c_void_p, c_void_p)
+
+    def on_error(_display, _event):
+        grab_errors.append(1)
+        return 0
+    error_handler = handler_type(on_error)
+    X11.XSetErrorHandler(error_handler)
+
+    display = X11.XOpenDisplay(None)
+    if not display:
+        fail("cannot open the X display")
+    root = X11.XDefaultRootWindow(display)
+
+    keycodes = [X11.XKeysymToKeycode(display, k) for k in (XK_CONTROL_L, XK_CONTROL_R)]
+    keycodes = [k for k in keycodes if k]
+    if not keycodes:
+        fail("no Control key in the keymap")
+
+    # Caps Lock / Num Lock are part of the modifier state, so grab every
+    # combination or the shortcut silently dies when Num Lock is on.
+    for keycode in keycodes:
+        for locks in (0, LOCK_MASK, MOD2_MASK, LOCK_MASK | MOD2_MASK):
+            X11.XGrabKey(display, keycode, MOD1_MASK | locks, root, 0,
+                         GRAB_MODE_ASYNC, GRAB_MODE_ASYNC)
+    X11.XSync(display, 0)
+    if grab_errors:
+        fail("Alt+Ctrl is already grabbed by another program")
+
+    # Children are fire-and-forget; let the kernel reap them.
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
+    keymap = (c_char * 32)()
+
+    def ctrl_held():
+        X11.XQueryKeymap(display, keymap)
+        return any(ord(keymap[k // 8]) & (1 << (k % 8)) for k in keycodes)
+
+    def drain():
+        # A passive grab turns into a full keyboard grab until the key is
+        # released. Drop it at once so Alt-first shortcuts such as
+        # Ctrl+Alt+T keep reaching the desktop.
+        while X11.XPending(display):
+            X11.XNextEvent(display, event)
+        X11.XUngrabKeyboard(display, CURRENT_TIME)
+        X11.XFlush(display)
+
+    event = ctypes.create_string_buffer(192)  # sizeof(XEvent)
+    print(f"xhisper-hotkey: press Alt then Ctrl to start/stop dictation ({xhisper})", file=sys.stderr)
+    while True:
+        X11.XNextEvent(display, event)
+        if ctypes.cast(event, ctypes.POINTER(c_int))[0] != KEY_PRESS:
+            continue
+        X11.XUngrabKeyboard(display, CURRENT_TIME)
+        X11.XFlush(display)
+        subprocess.Popen([xhisper, '--toggle'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        # One launch per press: Ctrl auto-repeats while held, and each repeat
+        # re-fires the grab. In toggle mode a repeat would stop the recording
+        # it just started, so this debounce is required, not an optimisation.
+        while ctrl_held():
+            drain()
+            time.sleep(0.03)
+        drain()
+
+
+if __name__ == '__main__':
+    main()

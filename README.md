@@ -10,6 +10,8 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 
 - **Linux and macOS** — Works on X11, Wayland, and macOS. Key release detection uses XQueryKeymap on X11, evdev on Wayland, and Quartz on macOS
 - **Push-to-talk** — Hold your shortcut key to record, release to transcribe. No double-press needed. A duplicate invocation while a recording is live is ignored (holding a key auto-repeats, and the desktop relaunches the command on every repeat); `xhisper --stop` ends a recording on purpose and can be bound to a second key
+- **Hands-free toggle (X11)** — With `xhisper-hotkey`, press Alt then Ctrl once to start recording and again to stop. No key to hold, and a modifier-only combo that GNOME shortcuts cannot bind
+- **Start sound** — Optional `start-sound` plays a short cue the moment recording starts
 - **AI auto-editing** — Removes filler words and stutters, applies spoken self-corrections ("Tuesday, no wait, Wednesday"), turns "new line" into a real line break, and fixes punctuation — without ever rewriting your wording. If the model errors out, times out, or returns something suspicious, the raw transcription is pasted instead, so a bad API response never costs you a dictation
 - **Tone adaptation** — Detects the active window (Slack, Gmail, VS Code, etc.) and lets it influence punctuation and formatting — light for chat, full sentences for email, no Markdown in a terminal. It never changes your words or the length
 - **Personal dictionary** — Add custom words, names, and technical terms to `~/.config/xhisper/dictionary.txt` to improve Whisper's recognition accuracy
@@ -102,6 +104,31 @@ gsettings set $custom_kbd:$kbd_path binding "$binding"
 gsettings set $custom_kbd:$kbd_path command "$action"
 ```
 
+#### Alternative: press Alt, then Ctrl — no holding (X11)
+
+GNOME shortcuts need a regular key, so a modifier-only combo cannot be bound
+above. `xhisper-hotkey` (installed by `make install`) fills that gap and works
+as a toggle: press **Alt**, then **Ctrl** (left or right) once to start
+recording, speak with your hands free, then press Alt then Ctrl again to stop
+and transcribe. The order matters: Ctrl then Alt does nothing, and Ctrl alone is
+untouched. Start it at every login with:
+
+```sh
+cp xhisper-hotkey.desktop ~/.config/autostart/
+/usr/local/bin/xhisper-hotkey &   # start it now without logging out
+```
+
+Notes:
+- X11 only (on Wayland, use a regular shortcut as above).
+- It does not fire while another program holds the keyboard — e.g. Deskflow
+  while the cursor is on the other machine.
+- Alt-first shortcuts like Ctrl+Alt+T still work, but they also toggle
+  recording. Press Ctrl first for those.
+- Each press runs `xhisper --toggle`. Do not bind `--toggle` to a regular
+  desktop shortcut: holding a key auto-repeats, and every repeat would toggle.
+- Set `start-sound` in `xhisperrc` to hear when recording starts.
+- Remove the Pause binding above if you don't want both shortcuts.
+
 ---
 
 ## Installation on macOS
@@ -163,8 +190,13 @@ deliberately does nothing: holding a key auto-repeats (X11 defaults to 33
 presses per second), and the desktop relaunches the command on every repeat, so
 a duplicate invocation cannot be told apart from the press you are still holding.
 
+**Toggle mode (no holding):** with [`xhisper-hotkey`](#alternative-press-alt-then-ctrl--no-holding-x11)
+running, press **Alt** then **Ctrl** once to start recording and once more to
+stop and transcribe. It runs `xhisper --toggle`, which records until the next
+`--toggle` (or `max-recording-seconds`).
+
 An animated wave pill overlay slides up from the bottom of your screen showing the current state:
-- **Recording** — animated wave bars while you hold the key
+- **Recording** — animated wave bars while you record (with an optional `start-sound` cue)
 - **Transcribing** — gentler pulse while Whisper processes your audio
 - **Editing** — AI is cleaning up your text
 - **Done** — brief confirmation, then fades out

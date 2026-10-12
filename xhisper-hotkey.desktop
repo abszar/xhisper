@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=xhisper hotkey
+Comment=Hold Alt then Ctrl to dictate with xhisper
+Exec=/usr/local/bin/xhisper-hotkey
+Icon=audio-input-microphone
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
