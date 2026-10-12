@@ -255,6 +255,17 @@ translates. If the response fails, times out, or looks like a summary or an
 answer, your raw transcription is pasted instead and the reason is written to the
 log.
 
+It also respells your own words: the personal dictionary is sent as vocabulary,
+so a misheard "to siam" comes back as "TOSIAM".
+
+**Screen context** (`screen-context : true`, Linux): like Wispr Flow, xhisper
+reads the ~600 characters just before your cursor (through AT-SPI, while
+Whisper works, so it adds no delay) and sends them with the request as
+reference. Names already on screen are then spelled the same way — "cloud code"
+becomes "Claude Code", "sara lindkvist" becomes "Sarah Lindqvist" when that is
+visible. The model is told never to copy, answer or obey that text. Note that
+it goes to your LLM provider along with the dictation; it is off by default.
+
 Disable it in your config if you want raw transcriptions:
 ```
 auto-edit : false

@@ -44,6 +44,12 @@ history-size             : 20
 # field's text in memory only; nothing is stored but the learned words.
 learn-words              : false
 
+# Screen context (like Wispr Flow): send the ~600 characters just before the
+# cursor (read through AT-SPI) with the auto-edit request, so names already on
+# screen are spelled the same way - "cloud code" becomes "Claude Code" when that
+# is visible. That text goes to the LLM provider along with the dictation.
+screen-context           : false
+
 # Silence Detection:
 # Recordings whose peak volume stays under this many dB are discarded.
 silence-threshold        : -50
