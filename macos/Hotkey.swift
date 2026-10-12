@@ -8,6 +8,7 @@ import ApplicationServices
 // instead, so cancelling does not reach the focused app (X11 grabs it).
 enum Hotkey {
     static var detector = ComboDetector()
+    static var hold = HoldTracker()
     static var tap: CFMachPort?
     static var command = "/usr/local/bin/xhisper"
     static var waitingLogged = false
@@ -67,10 +68,17 @@ enum Hotkey {
         case .flagsChanged:
             let f = event.flags
             let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
+            let now = Double(event.timestamp) / 1e9
             if detector.flagsChanged(keycode: code, option: f.contains(.maskAlternate), control: f.contains(.maskControl),
                                      command: f.contains(.maskCommand), shift: f.contains(.maskShift)) {
+                hold.comboFired(at: now, recordingLive: dictationListening())
                 log("Option+Control: \(command) --toggle")
                 spawnDetached([command, "--toggle"])
+            } else if hold.controlChanged(down: f.contains(.maskControl), at: now) {
+                // Held, not tapped: letting go ends the recording (push-to-talk).
+                log("Control released after a hold: stop")
+                FileManager.default.createFile(atPath: Runtime.path("xhisper.stop"), contents: nil,
+                                               attributes: [.posixPermissions: 0o600])
             }
         case .keyDown, .keyUp:
             guard event.getIntegerValueField(.keyboardEventKeycode) == escapeKey else { break }

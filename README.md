@@ -34,14 +34,14 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 
 | Feature | Linux | macOS |
 |---|---|---|
-| Hold-to-talk dictation, paste at cursor | ✅ | ✅ toggle (Option → Control), native Cmd+V (TextEdit verified); hold-to-talk ⏳ (bring your own launcher) |
+| Hold-to-talk dictation, paste at cursor | ✅ | ✅ toggle (tap Option → Control), native Cmd+V (TextEdit verified); hold-to-talk (keep Control held) ⏳ pending a hands-on test |
 | AI auto-edit, tone adaptation, answer guard | ✅ | ✅ (shared code) |
 | Personal dictionary (Whisper hints + auto-edit vocabulary) | ✅ | ✅ (shared code) |
 | `--toggle` mode, Escape to cancel, sound cues | ✅ | ✅ (toggle and Escape verified in TextEdit; the agent swallows Escape) |
 | Alt → Ctrl toggle hotkey | ✅ X11 (`xhisper-hotkey`) | ✅ Xhisper.app hotkey LaunchAgent |
 | Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ✅ native panel |
 | History window (Copy, Edit) | ✅ | ✅ native window |
-| Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit and Terminal.app; iTerm2 ⏳ (its focused element exposes no text in testing). Chrome/Electron: not forced, same limit as Linux |
+| Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit and Terminal.app; iTerm2 ⏳ pending a hands-on test (its terminal exposes text; the first test hit an iTerm update dialog). Chrome/Electron: not forced, same limit as Linux |
 | Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ⏳ pending a hands-on test |
 
 Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.
@@ -193,7 +193,7 @@ System Settings → Privacy & Security, enable **Xhisper** in:
 
 ### 5. Dictate
 
-Press **Option**, then **Control**: speak, then Option, Control again to paste.
+Press **Option**, then **Control**: speak, then Option, Control again to paste. Or hold it: keep Control down (0.4 s or more) while you speak, and the recording stops when you let go.
 Escape cancels. `xhisper --history` (or double-clicking Xhisper.app) shows past dictations.
 
 The order matters: Control then Option does nothing. Shortcuts that start with Option (say Ctrl+Opt+arrow pressed Option first) also toggle a recording, so press Control first for those, same as on Linux.
@@ -204,7 +204,7 @@ If you run from a checkout inside `~/Documents` (`xhisper.sh --local`), macOS ma
 
 ## Usage
 
-**Hold** your shortcut key to record, **release** to stop and transcribe. The transcribed text is pasted at your cursor. On macOS use the Option → Control toggle (below); hold-to-talk needs your own launcher and is untested there.
+**Hold** your shortcut key to record, **release** to stop and transcribe. The transcribed text is pasted at your cursor. On macOS the same Option → Control combo does both: tap it to toggle, or keep Control held to talk and release to stop.
 
 To end a recording without releasing the key, run **`xhisper --stop`** — bind it
 to a second shortcut if you want a stop key. Pressing the dictation hotkey again

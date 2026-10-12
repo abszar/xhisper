@@ -31,6 +31,29 @@ struct ComboDetector {
     }
 }
 
+/// Tap or hold. The combo always starts `xhisper --toggle` at once; when the
+/// press that started a recording is held at least `holdSeconds`, letting go
+/// of Control stops it again (push-to-talk). A quick tap leaves the recording
+/// running until the next combo. Only the release decides, so auto-repeat can
+/// never stop a recording.
+struct HoldTracker {
+    static let holdSeconds = 0.4
+    private var pressedAt: Double?
+
+    /// The combo fired. A press that stops a live recording is never a hold.
+    mutating func comboFired(at time: Double, recordingLive: Bool) {
+        pressedAt = recordingLive ? nil : time
+    }
+
+    /// Feed every Control change (`down`: some Control key still held).
+    /// Returns true when the recording should stop now.
+    mutating func controlChanged(down: Bool, at time: Double) -> Bool {
+        guard !down, let start = pressedAt else { return false }
+        pressedAt = nil
+        return time - start >= Self.holdSeconds
+    }
+}
+
 /// The key loop in xhisper.sh is `python3 -` (system python's real binary is
 /// named Python). Anything else holding a recycled pid is not listening.
 func isListener(_ argv: [String]) -> Bool {
