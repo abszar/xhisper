@@ -8,11 +8,11 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 
 ## Features
 
-- **Linux and macOS** — Works on X11, Wayland, and macOS. Key release detection uses XQueryKeymap on X11, evdev on Wayland, and Quartz on macOS
+- **Linux and macOS** — Works on X11, Wayland, and macOS. Key release detection uses XQueryKeymap on X11, evdev on Wayland, and CoreGraphics on macOS
 - **Push-to-talk** — Hold your shortcut key to record, release to transcribe. No double-press needed. A duplicate invocation while a recording is live is ignored (holding a key auto-repeats, and the desktop relaunches the command on every repeat); `xhisper --stop` ends a recording on purpose and can be bound to a second key
-- **Hands-free toggle (X11)** — With `xhisper-hotkey`, press Alt then Ctrl once to start recording and again to stop. No key to hold, and a modifier-only combo that GNOME shortcuts cannot bind
+- **Hands-free toggle (X11 and macOS)** — With `xhisper-hotkey` (X11) or Xhisper.app's hotkey agent (macOS), press Alt (Option) then Ctrl once to start recording and again to stop. No key to hold, and a modifier-only combo that GNOME shortcuts and macOS Services cannot bind
 - **Sound cues** — Optional `start-sound`, `stop-sound`, `cancel-sound` and `learned-sound` play when recording starts, stops, is cancelled, or a word is learned
-- **Escape to cancel** — Press Escape while recording to throw the recording away (on X11 the key is grabbed, so it does not also reach the focused app)
+- **Escape to cancel** — Press Escape while recording to throw the recording away (the key is swallowed, so it does not also reach the focused app: grabbed on X11, eaten by the hotkey agent on macOS)
 - **Live waveform** — While recording, the pill's bars follow your voice (they read the level of the audio being recorded), and drop to dots when you pause
 - **Learns your words** — Fix a misheard name once ("to Ziam" → "TOSIAM") right where it was pasted, or in the History window, and xhisper adds it to your dictionary. Learned words are sent to Whisper as spelling hints and to the auto-edit model as vocabulary
 - **Dictation history** — The last 20 dictations (`history-size`) are kept in a private file. Open them with `xhisper --history`, or with the **History** chip on the Recording / No sound pill; each one has a **Copy** button
@@ -20,7 +20,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 - **Tone adaptation** — Detects the active window (Slack, Gmail, VS Code, etc.) and lets it influence punctuation and formatting — light for chat, full sentences for email, no Markdown in a terminal. It never changes your words or the length
 - **Personal dictionary** — Add custom words, names, and technical terms to `~/.config/xhisper/dictionary.txt` (or `xhisper-learn add WORD`) to improve Whisper's recognition accuracy; the auto-edit model gets them too, so near-misses are respelled
 - **Animated status overlay** — A dark pill with animated sound wave bars slides up from the bottom of the screen during recording, transcribing, and editing (falls back to desktop notifications if GTK is unavailable)
-- **Smart paste** — Detects the active window *class* and uses the correct paste shortcut (Ctrl+V, Ctrl+Shift+V for terminals on Linux; Cmd+V, Cmd+Shift+V on macOS). Works natively with AZERTY, QWERTZ, or any keyboard layout
+- **Smart paste** — Detects the active window *class* and uses the correct paste shortcut (Ctrl+V, Ctrl+Shift+V for terminals on Linux; plain Cmd+V everywhere on macOS, since Cmd+Shift+V is "Paste Selection" in Terminal.app). Works natively with AZERTY, QWERTZ, or any keyboard layout
 - **Multi-language transcription** — Whisper auto-detects the spoken language by default, so you can switch between English, French, Spanish, etc. and each is transcribed in its own script. Set `language : en` (or any ISO 639-1 code) in the config to force a specific language
 - **Stability** — PID-file based concurrency control prevents duplicate instances from interfering with each other. Recordings are capped by `max-recording-seconds`, and every network call has a timeout
 - **Custom STT/LLM endpoints** — Use Groq's API by default, or point to any OpenAI-compatible endpoint — local Whisper servers, Ollama, vLLM, or any other provider
@@ -34,14 +34,15 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 
 | Feature | Linux | macOS |
 |---|---|---|
-| Hold-to-talk dictation, paste at cursor | ✅ | ✅ |
+| Hold-to-talk dictation, paste at cursor | ✅ | ✅ native Cmd+V (TextEdit verified) |
 | AI auto-edit, tone adaptation, answer guard | ✅ | ✅ (shared code) |
 | Personal dictionary (Whisper hints + auto-edit vocabulary) | ✅ | ✅ (shared code) |
-| `--toggle` mode, Escape to cancel, sound cues | ✅ | ⏳ untested since added |
-| Alt → Ctrl toggle hotkey (`xhisper-hotkey`) | ✅ X11 | ⏳ needs a CGEventTap agent |
-| Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ⏳ needs a native panel (falls back to notifications) |
-| History window (`xhisper-history`) | ✅ | ⏳ needs a native window |
-| Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ⏳ needs the Accessibility API |
+| `--toggle` mode, Escape to cancel, sound cues | ✅ | ✅ (toggle and Escape verified in TextEdit; the agent swallows Escape) |
+| Alt → Ctrl toggle hotkey | ✅ X11 (`xhisper-hotkey`) | ✅ Xhisper.app hotkey LaunchAgent |
+| Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ✅ native panel |
+| History window (Copy, Edit) | ✅ | ✅ native window |
+| Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit and Terminal.app; iTerm2 ⏳ (its focused element exposes no text in testing). Chrome/Electron: not forced, same limit as Linux |
+| Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ⏳ pending a hands-on test |
 
 Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.
 
@@ -153,10 +154,12 @@ Notes:
 
 ## Installation on macOS
 
+Tested on macOS 26 (Apple Silicon). Needs Xcode or the Command Line Tools (for `swiftc`).
+
 ### 1. Install dependencies
 
 ```sh
-brew install sox ffmpeg jq curl
+brew install sox ffmpeg jq
 ```
 
 ### 2. Get a Groq API key (or use a local server)
@@ -169,34 +172,33 @@ echo 'GROQ_API_KEY=<your_API_key>' >> ~/.env
 
 Or skip this step if you'll use a local Whisper/LLM server — see [Custom STT/LLM Endpoints](#custom-sttllm-endpoints).
 
-### 3. Clone and install
+### 3. Build and install
 
 ```sh
 git clone --depth 1 https://github.com/abszar/xhisper.git
 cd xhisper
-sudo make install
+macos/make-cert.sh   # once: a local signing identity, so permissions survive rebuilds
+make
+sudo make install    # Xhisper.app, the scripts, and the hotkey LaunchAgent
 ```
 
-### 4. Grant Accessibility permissions
+`macos/make-cert.sh` asks for your login password once (it trusts the new certificate for code signing). Without it the app is signed ad hoc and macOS forgets its permissions after every rebuild.
 
-xhisper uses `osascript` to simulate Cmd+V paste. macOS requires Accessibility permissions for this:
+### 4. Grant permissions
 
-1. Open **System Settings > Privacy & Security > Accessibility**
-2. Add your terminal app (Terminal.app, iTerm2, etc.) to the list
-3. If using Automator or a shortcut app, add that too
+System Settings → Privacy & Security, enable **Xhisper** in:
+- **Accessibility** — paste (Cmd+V), Escape-to-cancel, reading the text field for learning and screen context
+- **Input Monitoring** — the Option-then-Control hotkey
+- **Microphone** — asked the first time you dictate
 
-### 5. Set up a keyboard shortcut
+### 5. Dictate
 
-**Option A: Automator (built-in)**
-1. Open **Automator** > New > **Quick Action**
-2. Set "Workflow receives" to **no input**
-3. Add a **Run Shell Script** action with: `/usr/local/bin/xhisper`
-4. Save it (e.g., "xhisper")
-5. Go to **System Settings > Keyboard > Keyboard Shortcuts > Services** and assign a key
+Press **Option**, then **Control**: speak, then Option, Control again to paste.
+Escape cancels. `xhisper --history` (or double-clicking Xhisper.app) shows past dictations.
 
-**Option B: Karabiner-Elements**
-1. Install [Karabiner-Elements](https://karabiner-elements.pqrs.org/)
-2. Map your preferred key to run `/usr/local/bin/xhisper`
+The order matters: Control then Option does nothing. Shortcuts that start with Option (say Ctrl+Opt+arrow pressed Option first) also toggle a recording, so press Control first for those, same as on Linux.
+
+If you run from a checkout inside `~/Documents` (`xhisper.sh --local`), macOS may ask to let Xhisper access Documents; allow it.
 
 ---
 
@@ -211,7 +213,7 @@ presses per second), and the desktop relaunches the command on every repeat, so
 a duplicate invocation cannot be told apart from the press you are still holding.
 
 **Toggle mode (no holding):** with [`xhisper-hotkey`](#alternative-press-alt-then-ctrl--no-holding-x11)
-running, press **Alt** then **Ctrl** once to start recording and once more to
+running (on macOS, the hotkey agent installed with Xhisper.app; **Option** then **Control**), press **Alt** then **Ctrl** once to start recording and once more to
 stop and transcribe. It runs `xhisper --toggle`, which records until the next
 `--toggle` (or `max-recording-seconds`).
 
@@ -227,7 +229,7 @@ a cancel) and the pill slides into the history window. Kept: the last
 dictation in place and learns the words you corrected.
 
 **Learning words:** with `learn-words : true`, xhisper follows the field it
-pasted into for a minute (through Linux accessibility, AT-SPI). Replace a
+pasted into for a minute (through AT-SPI on Linux or the Accessibility API on macOS). Replace a
 misheard word there — say "to Ziam" with "TOSIAM" — and once the fix has sat
 for three seconds (or is sent with Enter), the new word is added to your
 dictionary. A *Learned: WORD* pill confirms it, with an optional
@@ -236,8 +238,8 @@ it) and its **Unlearn** button takes the word back out if the fix was a
 mistake. Only words that replace dictated words and are not ordinary
 English are learned; an all-lowercase word must also be a real change of word
 ("Qulify" → "coolify"), so typo and accent fixes teach nothing. It works where the app exposes its text (GTK apps, terminals such as
-Tilix/GNOME Terminal, Firefox; Chrome and Electron apps only with accessibility
-on). The text is read in memory only; only learned words are stored. Manage
+Tilix/GNOME Terminal, Firefox; on macOS TextEdit and Terminal.app; Chrome and Electron apps only with accessibility
+on, which xhisper does not force). The text is read in memory only; only learned words are stored. Manage
 the list with `xhisper-learn list | add WORD | remove WORD`.
 
 An animated wave pill overlay slides up from the bottom of your screen showing the current state:
@@ -346,7 +348,7 @@ When the LLM times out, the raw transcription is pasted rather than nothing.
 xhisper --log
 ```
 
-The log lives in `$XDG_RUNTIME_DIR/xhisper/xhisper.log` (a 0700 directory), holds
+The log lives in `$XDG_RUNTIME_DIR/xhisper/xhisper.log` (a 0700 directory; on macOS `$(getconf DARWIN_USER_TEMP_DIR)xhisper`), holds
 the last few hundred lines, and contains every transcription — so it is kept out
 of world-readable `/tmp`.
 
@@ -384,9 +386,11 @@ cp default_dictionary.txt ~/.config/xhisper/dictionary.txt
 
 **No sound detected**: Check that `sox` is installed (`brew install sox`) and your microphone is accessible. Test with `rec test.wav`.
 
-**Paste not working**: Make sure your terminal/automation app has Accessibility permissions (System Settings > Privacy & Security > Accessibility).
+**Paste not working**: Xhisper needs Accessibility (System Settings > Privacy & Security > Accessibility). `xhisper --log` says so with a `Paste:` line.
 
-**"Not allowed to send keystrokes"**: This means the app running xhisper needs to be added to the Accessibility list in System Settings.
+**Hotkey does nothing**: Check `cat $(getconf DARWIN_USER_TEMP_DIR)xhisper/xhisper-hotkey.log`. After an unsigned rebuild (no `macos/make-cert.sh`), re-enable Xhisper in Accessibility and Input Monitoring.
+
+**Logs**: `xhisper --log`. macOS keeps runtime state in `$(getconf DARWIN_USER_TEMP_DIR)xhisper`.
 
 ---
 

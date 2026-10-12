@@ -22,12 +22,14 @@ language                 : ""
 # shortcut. Pressing the dictation hotkey again does nothing, on purpose.
 max-recording-seconds    : 300
 
-# Sounds (empty = silent). Any file paplay/afplay can play, e.g. from
-# /usr/share/sounds/freedesktop/stereo/. Escape cancels a recording.
-start-sound              :
-stop-sound               :
-cancel-sound             :
-learned-sound            :    # played with the "Learned: WORD" pill (see learn-words)
+# Sounds. Any file paplay/afplay can play, e.g. /usr/share/sounds/freedesktop/stereo/
+# (Linux) or /System/Library/Sounds/ (macOS). Escape cancels a recording.
+# Leave a key out for the default (silent on Linux; Tink, Pop, Basso and Glass
+# on macOS); set it to an empty value to silence it.
+# start-sound   : /System/Library/Sounds/Tink.aiff
+# stop-sound    : /System/Library/Sounds/Pop.aiff
+# cancel-sound  : /System/Library/Sounds/Basso.aiff
+# learned-sound : /System/Library/Sounds/Glass.aiff   # with the "Learned: WORD" pill (see learn-words)
 
 # History:
 # Number of past dictations kept for 'xhisper --history' and the History chip
@@ -35,8 +37,8 @@ learned-sound            :    # played with the "Learned: WORD" pill (see learn-
 history-size             : 20
 
 # Learning:
-# After each paste, follow the text field for a minute (Linux accessibility,
-# AT-SPI) and learn the words you correct in it - e.g. fix "to Ziam" into
+# After each paste, follow the text field for a minute (AT-SPI on Linux, the
+# Accessibility API on macOS) and learn the words you correct in it - e.g. fix "to Ziam" into
 # "TOSIAM" once and it goes into dictionary.txt. Only replaced words that are
 # not ordinary English are learned, and lowercase ones only when the fix is a
 # real change of word, not a typo or accent fix. Editing a
@@ -45,7 +47,7 @@ history-size             : 20
 learn-words              : false
 
 # Screen context (like Wispr Flow): send the ~600 characters just before the
-# cursor (read through AT-SPI) with the auto-edit request, so names already on
+# cursor (read through AT-SPI or the Accessibility API) with the auto-edit request, so names already on
 # screen are spelled the same way - "cloud code" becomes "Claude Code" when that
 # is visible. That text goes to the LLM provider along with the dictation.
 screen-context           : false
