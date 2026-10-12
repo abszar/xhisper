@@ -16,6 +16,9 @@ private let textColor = (r: 0.80, g: 0.78, b: 0.73, a: 0.9)
 private let chipColor: CGFloat = 0.10
 private let chipHoverColor: CGFloat = 0.22
 private let launchSeconds = 0.28  // pill-to-window transition
+// The geometry below is the Linux pill's, in its pixels. On a Mac those
+// become points and the pill read too big, so the whole drawing is scaled.
+private let pillScale: CGFloat = 0.8
 private let stateLabels = ["recording": "Recording", "transcribing": "Transcribing", "editing": "Editing",
                            "done": "Done", "silent": "No sound", "error": "Failed",
                            "cancelled": "Cancelled", "learned": "Learned"]
@@ -61,6 +64,8 @@ final class PillView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func draw(_ dirtyRect: NSRect) {
         guard let cg = NSGraphicsContext.current?.cgContext else { return }
+        cg.clear(bounds)
+        cg.scaleBy(x: pillScale, y: pillScale)
         pill.draw(cg)
     }
     override func updateTrackingAreas() {
@@ -70,8 +75,13 @@ final class PillView: NSView {
     }
     override func mouseEntered(with event: NSEvent) { pill.pointerInside = true }
     override func mouseExited(with event: NSEvent) { pill.pointerInside = false; pill.setChipHover(false) }
-    override func mouseMoved(with event: NSEvent) { pill.setChipHover(pill.inChip(convert(event.locationInWindow, from: nil))) }
-    override func mouseDown(with event: NSEvent) { pill.click(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseMoved(with event: NSEvent) { pill.setChipHover(pill.inChip(designPoint(event))) }
+    override func mouseDown(with event: NSEvent) { pill.click(at: designPoint(event)) }
+    /// The event position in the pill's unscaled geometry.
+    private func designPoint(_ event: NSEvent) -> NSPoint {
+        let p = convert(event.locationInWindow, from: nil)
+        return NSPoint(x: p.x / pillScale, y: p.y / pillScale)
+    }
 }
 
 final class Pill {
@@ -137,8 +147,8 @@ final class Pill {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main!
         let visible = screen.visibleFrame  // above the Dock
-        target = NSPoint(x: (visible.midX - pillWidth / 2).rounded(), y: visible.minY + 55)
-        let size = NSSize(width: pillWidth + 2, height: pillHeight + 4)
+        target = NSPoint(x: (visible.midX - pillWidth * pillScale / 2).rounded(), y: visible.minY + 55)
+        let size = NSSize(width: (pillWidth + 2) * pillScale, height: (pillHeight + 4) * pillScale)
         panel = PillPanel(contentRect: NSRect(origin: NSPoint(x: target.x, y: target.y - slideDistance), size: size),
                           styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false
