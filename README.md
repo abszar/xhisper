@@ -24,7 +24,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 - **Multi-language transcription** — Whisper auto-detects the spoken language by default, so you can switch between English, French, Spanish, etc. and each is transcribed in its own script. Set `language : en` (or any ISO 639-1 code) in the config to force a specific language
 - **Stability** — PID-file based concurrency control prevents duplicate instances from interfering with each other. Recordings are capped by `max-recording-seconds`, and every network call has a timeout
 - **Custom STT/LLM endpoints** — Use Groq's API by default, or point to any OpenAI-compatible endpoint — local Whisper servers, Ollama, vLLM, or any other provider
-- **Smart spacing** — A dictation pasted right after a word or a full stop gets a leading space, so two dictations in a row never glue together ("goes.Ok"). Only the one character before the cursor is read; `smart-spacing : false` turns it off
+- **Smart spacing** — A dictation pasted right after a word or a full stop gets a leading space, so two dictations in a row never glue together ("goes.Ok"). Only the one character before the cursor is read. Where an app does not expose its text (cmux), xhisper remembers the end of its own last paste into that app for two minutes instead. `smart-spacing : false` turns it off
 - **Clipboard preservation** — Your clipboard content is saved before transcription and restored after pasting
 - **Clipboard manager cleanup** — Automatically removes xhisper's temporary clipboard entries from CopyQ history
 - **Private by default** — The recording, the log of everything you dictated, and the request sent to the LLM live in a 0700 directory under `$XDG_RUNTIME_DIR`, never in world-readable `/tmp`. API keys are handed to `curl` over stdin so they never appear in `ps`
@@ -43,7 +43,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 | Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ✅ native panel |
 | History window (Copy, Edit) | ✅ | ✅ native window |
 | Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit; Terminal.app exposes its text (read check only); iTerm2: screen context ✅, learning watcher attaches (a correction there not yet tested). Chrome/Electron: not forced, same limit as Linux |
-| Smart spacing between dictations (`smart-spacing`) | ✅ AT-SPI (GTK field, Tilix; an unreadable field pastes unchanged) | ⏳ confirm with a hands-on test |
+| Smart spacing between dictations (`smart-spacing`) | ✅ AT-SPI (GTK field, Tilix); last-paste fallback for unreadable fields ⏳ retest | ✅ TextEdit (empty field, after ".", after a space and "("; a later fix is still learned), Chrome; cmux ✅ via the last-paste fallback (its terminal exposes no text, so no learning there) |
 | Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ✅ iTerm2 (tap, hold, Escape not reaching Claude Code); Terminal.app ⏳ untested |
 
 Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.

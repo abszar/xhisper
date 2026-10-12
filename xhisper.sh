@@ -1294,8 +1294,9 @@ save_history "$TRANSCRIPTION"
 PASTE_TEXT="$TRANSCRIPTION"
 if [ -n "$BEFORE_PID" ]; then
   wait "$BEFORE_PID" 2>/dev/null
-  if [ "$(printf '%s\0%s' "$(cat "$BEFORE_FILE" 2>/dev/null)" "$TRANSCRIPTION" \
-          | "$XHISPER_LEARN" spacing 2>/dev/null)" = "space" ]; then
+  # Unreadable fields fall back on our own last paste into the same app.
+  if [ "$(printf '%s\0%s\0%s\0%s' "$(cat "$BEFORE_FILE" 2>/dev/null)" "$IS_TERMINAL" "$ACTIVE_CLASS" \
+          "$TRANSCRIPTION" | "$XHISPER_LEARN" spacing 2>/dev/null)" = "space" ]; then
     PASTE_TEXT=" $TRANSCRIPTION"
     log_line "Smart spacing: added a leading space"
   fi

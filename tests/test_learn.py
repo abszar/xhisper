@@ -259,3 +259,32 @@ class PasteTimeDifferences(unittest.TestCase):
                                   "goes. Ok, now I'm trying the ZORBIX to talk."])
         learn.follow(reader, learn.tokenize(dictation))
         self.assertEqual(self.learned, ["ZORBIX"])
+
+
+class SpacingFallback(unittest.TestCase):
+    """Unreadable fields (cmux) fall back on xhisper's own last paste."""
+
+    LAST = {"time": 1000.0, "app": "com.cmuxterm.app", "last": "."}
+
+    def decide(self, state, terminal=False, app="com.cmuxterm.app", last=LAST, now=1030.0, text="Ok, now"):
+        return learn.leading_space(state, text, terminal, app, last, now)
+
+    def test_readable_field_uses_the_real_character(self):
+        self.assertTrue(self.decide("C."))
+        self.assertFalse(self.decide("C "))
+        self.assertFalse(self.decide("C", last=self.LAST))  # caret at the start of a readable field
+
+    def test_empty_readable_field_is_trusted(self):
+        self.assertFalse(self.decide("E", terminal=False))
+
+    def test_unreadable_uses_last_paste(self):
+        self.assertTrue(self.decide("U"))
+        self.assertTrue(self.decide("", terminal=True))      # read timed out
+        self.assertTrue(self.decide("E", terminal=True))     # terminal exposing no text (cmux)
+
+    def test_fallback_limits(self):
+        self.assertFalse(self.decide("U", app="com.apple.TextEdit"))          # another app
+        self.assertFalse(self.decide("U", now=1000.0 + 121))                   # too old
+        self.assertFalse(self.decide("U", last=None))                          # nothing pasted yet
+        self.assertFalse(self.decide("U", last=dict(self.LAST, last=" ")))     # ended with a space
+        self.assertFalse(self.decide("U", text=", and"))                       # starts with punctuation
