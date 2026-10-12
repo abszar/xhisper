@@ -22,9 +22,16 @@ language                 : ""
 # shortcut. Pressing the dictation hotkey again does nothing, on purpose.
 max-recording-seconds    : 300
 
-# Sound played when recording starts (empty = silent). Any file paplay/afplay
-# can play, e.g. /usr/share/sounds/freedesktop/stereo/message-new-instant.oga
+# Sounds (empty = silent). Any file paplay/afplay can play, e.g. from
+# /usr/share/sounds/freedesktop/stereo/. Escape cancels a recording.
 start-sound              :
+stop-sound               :
+cancel-sound             :
+
+# History:
+# Number of past dictations kept for 'xhisper --history' and the History chip
+# on the overlay (0 = keep none). Stored 0600 in ~/.local/state/xhisper/.
+history-size             : 20
 
 # Silence Detection:
 # Recordings whose peak volume stays under this many dB are discarded.

@@ -6,6 +6,7 @@
 # `xhisper --stop` ends a live recording (bind it to a second key if you want
 # a stop shortcut). A duplicate invocation of the hotkey itself is ignored,
 # because holding a key auto-repeats and the desktop relaunches on every repeat.
+# Escape cancels a live recording. `xhisper --history` shows past dictations.
 # `xhisper --toggle` is the press-once mode: it records until the next
 # `--toggle`. Only use it from a trigger that fires once per press
 # (xhisper-hotkey), never from a plain desktop shortcut.
@@ -40,8 +41,17 @@ RECORDING="$RUNTIME_DIR/xhisper.wav"
 LOGFILE="$RUNTIME_DIR/xhisper.log"
 PIDFILE="$RUNTIME_DIR/xhisper.pid"
 STOPFILE="$RUNTIME_DIR/xhisper.stop"
+HISTORYFLAG="$RUNTIME_DIR/xhisper.history"
 LLM_REQUEST="$RUNTIME_DIR/llm-request.json"
 export XHISPER_STOPFILE="$STOPFILE"
+# Written by the overlay when its History button is clicked mid-recording:
+# the key loop treats it as a cancel and leaves the overlay to its transition.
+export XHISPER_HISTORYFLAG="$HISTORYFLAG"
+
+# Dictation history outlives reboots (unlike the runtime dir), so it lives in
+# the state dir, 0600, trimmed to history-size entries.
+HISTORY_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/xhisper/history.jsonl"
+export XHISPER_HISTORY_FILE="$HISTORY_FILE"
 
 usage() {
   cat <<EOF
@@ -59,6 +69,9 @@ Options:
   --stop      Stop a recording that is currently running and exit
   --toggle    Press-once mode: record until the next --toggle (no holding).
               Needs a trigger that fires once per press, like xhisper-hotkey
+  --history   Show the last dictations, with a copy button for each
+
+While recording, press Escape to cancel.
   --help      Show this help and exit
   --version   Print the version and exit
 
@@ -73,6 +86,7 @@ EOF
 # Parse command-line arguments
 LOCAL_MODE=0
 TOGGLE_MODE=0
+HISTORY_MODE=0
 WRAP_KEY=""
 for arg in "$@"; do
   case "$arg" in
@@ -93,6 +107,9 @@ for arg in "$@"; do
       ;;
     --toggle)
       TOGGLE_MODE=1
+      ;;
+    --history)
+      HISTORY_MODE=1
       ;;
     --help|-h)
       usage
@@ -123,10 +140,16 @@ if [ "$LOCAL_MODE" -eq 1 ]; then
   XHISPERTOOL="$SCRIPT_DIR/xhispertool"
   XHISPERTOOLD="$SCRIPT_DIR/xhispertoold"
   XHISPER_NOTIFY="$SCRIPT_DIR/xhisper-notify"
+  XHISPER_HISTORY="$SCRIPT_DIR/xhisper-history"
 else
   XHISPERTOOL="xhispertool"
   XHISPERTOOLD="xhispertoold"
   XHISPER_NOTIFY="xhisper-notify"
+  XHISPER_HISTORY="xhisper-history"
+fi
+
+if [ "$HISTORY_MODE" -eq 1 ]; then
+  exec "$XHISPER_HISTORY"
 fi
 
 if [ "$OS" = "Darwin" ]; then
@@ -144,6 +167,9 @@ tone_adaptation="true"
 language=""
 max_recording_seconds=300
 start_sound=""
+stop_sound=""
+cancel_sound=""
+history_size=20
 stt_url="https://api.groq.com/openai/v1"
 stt_api_key=""
 stt_model=""
@@ -188,6 +214,9 @@ if [ -f "$CONFIG_FILE" ]; then
       language) language="$value" ;;
       max-recording-seconds) max_recording_seconds="$value" ;;
       start-sound) start_sound="$value" ;;
+      stop-sound) stop_sound="$value" ;;
+      cancel-sound) cancel_sound="$value" ;;
+      history-size) history_size="$value" ;;
       stt-url) stt_url="$value" ;;
       stt-api-key) stt_api_key="$value" ;;
       stt-model) stt_model="$value" ;;
@@ -248,7 +277,7 @@ if [ -f "$PIDFILE" ]; then
   fi
   rm -f "$PIDFILE"
 fi
-rm -f "$STOPFILE"
+rm -f "$STOPFILE" "$HISTORYFLAG"
 printf '%s %s\n' "$$" "$(date +%s)" > "$PIDFILE"
 
 log_line() {
@@ -353,6 +382,34 @@ paste() {
   press_wrap_key
 }
 
+# Play a cue sound, if configured. Detached and fully redirected so it never
+# delays capture or holds this script's stdout open.
+play_sound() {
+  [ -n "$1" ] && [ -f "$1" ] || return 0
+  if [ "$OS" = "Darwin" ]; then
+    afplay "$1" < /dev/null > /dev/null 2>&1 &
+  elif command -v paplay > /dev/null; then
+    paplay "$1" < /dev/null > /dev/null 2>&1 &
+  else
+    pw-play "$1" < /dev/null > /dev/null 2>&1 &
+  fi
+}
+
+# Append one dictation to the history and keep only the last history_size.
+save_history() {
+  [ "$history_size" -gt 0 ] 2>/dev/null || return 0
+  (
+    umask 077
+    mkdir -p "$(dirname "$HISTORY_FILE")" || exit 0
+    jq -nc --arg time "$(date '+%Y-%m-%dT%H:%M:%S%z')" --arg text "$1" \
+      '{time: $time, text: $text}' >> "$HISTORY_FILE" || exit 0
+    if [ "$(wc -l < "$HISTORY_FILE")" -gt "$history_size" ]; then
+      tail -n "$history_size" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" &&
+        mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+    fi
+  )
+}
+
 # Status overlay (animated wave pill, falls back to notify-send)
 show_status() {
   if command -v "$XHISPER_NOTIFY" &> /dev/null; then
@@ -364,6 +421,7 @@ show_status() {
       editing)      osascript -e 'display notification "Editing..." with title "xhisper"' ;;
       done)         osascript -e 'display notification "Done" with title "xhisper"' ;;
       silent)       osascript -e 'display notification "No sound detected" with title "xhisper"' ;;
+      cancelled)    osascript -e 'display notification "Cancelled" with title "xhisper"' ;;
       error)        osascript -e 'display notification "Something went wrong" with title "xhisper"' ;;
     esac
   else
@@ -373,6 +431,7 @@ show_status() {
       editing)      notify-send -a xhisper "xhisper" "Editing..." -t 30000 ;;
       done)         notify-send -a xhisper "xhisper" "Done" -t 1000 ;;
       silent)       notify-send -a xhisper "xhisper" "No sound detected" -t 2000 ;;
+      cancelled)    notify-send -a xhisper "xhisper" "Cancelled" -t 1200 ;;
       error)        notify-send -a xhisper "xhisper" "Something went wrong — run 'xhisper --log'" -t 4000 ;;
     esac
   fi
@@ -672,12 +731,15 @@ auto_edit_text() {
 # Auto-detects X11 vs Wayland and uses the appropriate method.
 # Prints why the recording ended (the single most useful line in the log when
 # push-to-talk misbehaves) and sets KEY_REASON.
-# Exit codes: 0 = released (or nothing was held), 3 = cannot read the keyboard.
+# Exit codes: 0 = released (or nothing was held), 3 = cannot read the keyboard,
+# 4 = cancelled with Escape, 5 = cancelled by the overlay's History button.
 wait_for_key_release() {
   KEY_REASON=$(XHISPER_MAX_SECONDS="$max_recording_seconds" XHISPER_TOGGLE="$TOGGLE_MODE" python3 << 'PYEOF'
 import os, sys, time
 
 stopfile = os.environ.get('XHISPER_STOPFILE')
+historyflag = os.environ.get('XHISPER_HISTORYFLAG')
+toggle = os.environ.get('XHISPER_TOGGLE') == '1'
 
 try:
     max_seconds = float(os.environ.get('XHISPER_MAX_SECONDS') or 0)
@@ -690,20 +752,19 @@ def finish(reason, code=0):
     raise SystemExit(code)
 
 def stop_requested():
-    """Why we should stop early, or None to keep recording."""
+    """(reason, exit code) if we should stop early, or None to keep recording."""
     if deadline and time.time() > deadline:
-        return 'max-recording-seconds reached'
+        return ('max-recording-seconds reached', 0)
     if stopfile and os.path.exists(stopfile):
-        return 'stop requested (xhisper --stop or --toggle)'
+        return ('stop requested (xhisper --stop or --toggle)', 0)
+    if historyflag and os.path.exists(historyflag):
+        return ('cancelled (History button)', 5)
     return None
 
-if os.environ.get('XHISPER_TOGGLE') == '1':
-    # Press-once mode: no key is held, so only a stop or the cap ends it.
-    while True:
-        time.sleep(0.05)
-        reason = stop_requested()
-        if reason:
-            finish(reason)
+# Each backend provides read_keys() -> set of pressed key codes, ESC (its code
+# for Escape), escape_pressed(keys) and close(). Escape is caught from key
+# events where possible: a quick tap can fall entirely between two polls.
+session = os.environ.get('XDG_SESSION_TYPE', 'x11')
 
 if sys.platform == 'darwin':
     # macOS: use Quartz CGEventSource to detect key state
@@ -711,71 +772,76 @@ if sys.platform == 'darwin':
         from Quartz import CGEventSourceKeyState, kCGEventSourceStateHIDSystemState
     except ImportError:
         finish('cannot read the keyboard (Quartz missing)', 3)
-    time.sleep(0.05)
-    # Find which keys are currently pressed (scan common key range 0-127)
-    pressed = [k for k in range(128) if CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, k)]
-    if not pressed:
-        finish('no key was held (treated as a tap)')
-    while True:
-        time.sleep(0.05)
-        reason = stop_requested()
-        if reason:
-            finish(reason)
-        if not any(CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, k) for k in pressed):
-            finish('key released')
+    ESC = 53
+    def read_keys():
+        # Scan the common key range 0-127
+        return {k for k in range(128) if CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, k)}
+    def escape_pressed(keys):
+        return ESC in keys
+    def close():
+        pass
 
-session = os.environ.get('XDG_SESSION_TYPE', 'x11')
-
-if session != 'wayland':
+elif session != 'wayland':
     # X11: use XQueryKeymap
-    from ctypes import cdll, c_char
+    import ctypes
+    from ctypes import c_char, c_int, c_uint, c_ulong, c_void_p
     try:
-        X11 = cdll.LoadLibrary("libX11.so.6")
+        X11 = ctypes.cdll.LoadLibrary("libX11.so.6")
     except OSError:
         finish('cannot read the keyboard (libX11 missing)', 3)
+    X11.XOpenDisplay.restype = c_void_p
+    X11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    X11.XDefaultRootWindow.restype = c_ulong
+    X11.XDefaultRootWindow.argtypes = [c_void_p]
+    X11.XKeysymToKeycode.restype = ctypes.c_ubyte
+    X11.XKeysymToKeycode.argtypes = [c_void_p, c_ulong]
+    X11.XGrabKey.argtypes = [c_void_p, c_int, c_uint, c_ulong, c_int, c_int, c_int]
+    X11.XQueryKeymap.argtypes = [c_void_p, c_void_p]
+    X11.XSync.argtypes = [c_void_p, c_int]
+    X11.XCloseDisplay.argtypes = [c_void_p]
+    X11.XPending.argtypes = [c_void_p]
+    X11.XNextEvent.argtypes = [c_void_p, c_void_p]
+    # Without a handler, a failed grab (BadAccess) would make Xlib exit us.
+    on_error = ctypes.CFUNCTYPE(c_int, c_void_p, c_void_p)(lambda d, e: 0)
+    X11.XSetErrorHandler(on_error)
     display = X11.XOpenDisplay(None)
     if not display:
         finish('cannot read the keyboard (no X display)', 3)
-    keys_start = (c_char * 32)()
-    keys_check = (c_char * 32)()
-    time.sleep(0.05)
-    X11.XQueryKeymap(display, keys_start)
-    pressed = set()
-    for i in range(32):
-        b = keys_start[i] if isinstance(keys_start[i], int) else ord(keys_start[i])
-        for bit in range(8):
-            if b & (1 << bit):
-                pressed.add(i * 8 + bit)
-    if not pressed:
-        X11.XCloseDisplay(display)
-        finish('no key was held (treated as a tap)')
-    while True:
-        time.sleep(0.05)
-        reason = stop_requested()
-        if reason:
-            X11.XCloseDisplay(display)
-            finish(reason)
-        X11.XQueryKeymap(display, keys_check)
-        still = False
-        for kc in pressed:
-            b = keys_check[kc // 8]
-            b = b if isinstance(b, int) else ord(b)
-            if b & (1 << (kc % 8)):
-                still = True
-                break
-        if not still:
-            break
-    X11.XCloseDisplay(display)
-    finish('key released')
+    ESC = X11.XKeysymToKeycode(display, 0xff1b)
+    if ESC:
+        # Grab Escape for the length of the recording so cancelling does not
+        # also close the dialog or leave insert mode in the focused app. If
+        # another client owns the grab, Escape is still seen via the keymap.
+        X11.XGrabKey(display, ESC, 1 << 15, X11.XDefaultRootWindow(display), 0, 1, 1)
+        X11.XSync(display, 0)
+    keymap = (c_char * 32)()
+    event = ctypes.create_string_buffer(192)  # sizeof(XEvent)
+    def read_keys():
+        X11.XQueryKeymap(display, keymap)
+        return {i * 8 + bit for i in range(32) for bit in range(8)
+                if ord(keymap[i]) & (1 << bit)}
+    def escape_pressed(keys):
+        hit = ESC in keys
+        # Escape is the only key we grab, so any KeyPress (type 2) is Escape.
+        while X11.XPending(display):
+            X11.XNextEvent(display, event)
+            if ctypes.cast(event, ctypes.POINTER(c_int))[0] == 2:
+                hit = True
+        return hit
+    def close():
+        X11.XCloseDisplay(display)  # also releases the Escape grab
+
 else:
     # Wayland: use evdev (kernel input subsystem)
-    import fcntl, glob
+    import fcntl, glob, struct
 
     def EVIOCGKEY(length):
         return (2 << 30) | (ord('E') << 8) | 0x18 | (length << 16)
 
     KEY_MAX = 0x2ff
     BUF = (KEY_MAX + 7) // 8 + 1
+    ESC = 1  # KEY_ESC
+    EVENT = struct.calcsize('llHHi')  # struct input_event
 
     def find_keyboards():
         kbds = []
@@ -792,17 +858,10 @@ else:
                 pass
         return kbds
 
-    def get_pressed(fd, buf):
-        try:
-            fcntl.ioctl(fd, EVIOCGKEY(BUF), buf)
-        except OSError:
-            return set()
-        return {i for i in range(KEY_MAX + 1) if buf[i // 8] & (1 << (i % 8))}
-
     fds = []
     for kb in find_keyboards():
         try:
-            fds.append(os.open(kb, os.O_RDONLY))
+            fds.append(os.open(kb, os.O_RDONLY | os.O_NONBLOCK))
         except OSError:
             pass
     if not fds:
@@ -810,32 +869,57 @@ else:
         # and look like "no sound detected".
         finish('cannot read the keyboard (no readable /dev/input device)', 3)
 
-    time.sleep(0.05)
     buf = bytearray(BUF)
-    initial = set()
-    for fd in fds:
-        initial |= get_pressed(fd, buf)
-    if not initial:
-        for fd in fds: os.close(fd)
-        finish('no key was held (treated as a tap)')
-
-    while True:
-        time.sleep(0.05)
-        reason = stop_requested()
-        if reason:
-            for fd in fds: os.close(fd)
-            finish(reason)
-        still = False
+    def read_keys():
+        keys = set()
         for fd in fds:
-            if initial & get_pressed(fd, buf):
-                still = True
-                break
-        if not still:
-            break
+            try:
+                fcntl.ioctl(fd, EVIOCGKEY(BUF), buf)
+            except OSError:
+                continue
+            keys |= {i for i in range(KEY_MAX + 1) if buf[i // 8] & (1 << (i % 8))}
+        return keys
+    def escape_pressed(keys):
+        hit = ESC in keys
+        for fd in fds:
+            while True:
+                try:
+                    data = os.read(fd, EVENT * 64)
+                except OSError:  # EAGAIN: nothing queued
+                    break
+                if not data:
+                    break
+                for off in range(0, len(data) - EVENT + 1, EVENT):
+                    _, _, etype, code, value = struct.unpack_from('llHHi', data, off)
+                    if etype == 1 and code == ESC and value == 1:  # EV_KEY press
+                        hit = True
+        return hit
+    def close():
+        for fd in fds:
+            os.close(fd)
 
-    for fd in fds:
-        os.close(fd)
-    finish('key released')
+# Snapshot the held hotkey ~50 ms after launch, then wait for that set to be
+# released. In toggle mode nothing is held: only a stop, a cancel or the cap
+# ends the recording.
+time.sleep(0.05)
+held = set() if toggle else read_keys() - {ESC}
+if not toggle and not held:
+    close()
+    finish('no key was held (treated as a tap)')
+
+while True:
+    time.sleep(0.025)  # fast enough to catch a quick Escape tap by state alone
+    stop = stop_requested()
+    if stop:
+        close()
+        finish(*stop)
+    keys = read_keys()
+    if escape_pressed(keys):
+        close()
+        finish('cancelled (Escape)', 4)
+    if not toggle and not (held & keys):
+        close()
+        finish('key released')
 PYEOF
 )
 }
@@ -850,7 +934,7 @@ cleanup() {
   # Terminal overlays (done/silent/error) are meant to stay on screen after we
   # exit, so only hide the ones that would otherwise linger forever.
   [ "$FINAL_OVERLAY" -eq 0 ] && hide_status
-  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$LLM_REQUEST"
+  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$HISTORYFLAG" "$LLM_REQUEST"
   if [ -n "$SAVED_CLIPBOARD" ]; then
     printf '%s' "$SAVED_CLIPBOARD" | $CLIP_COPY
   fi
@@ -910,17 +994,7 @@ show_status recording
 # Small delay to let the DE finish processing the shortcut key
 sleep 0.15
 
-# Audible cue that recording starts. Detached and fully redirected so it never
-# delays capture or holds this script's stdout open.
-if [ -n "$start_sound" ] && [ -f "$start_sound" ]; then
-  if [ "$OS" = "Darwin" ]; then
-    afplay "$start_sound" < /dev/null > /dev/null 2>&1 &
-  elif command -v paplay > /dev/null; then
-    paplay "$start_sound" < /dev/null > /dev/null 2>&1 &
-  else
-    pw-play "$start_sound" < /dev/null > /dev/null 2>&1 &
-  fi
-fi
+play_sound "$start_sound"
 
 # Start recording in background
 rm -f "$RECORDING"
@@ -957,6 +1031,20 @@ if [ "$KEY_RC" -eq 3 ]; then
   fi
 fi
 
+# 4 = Escape, 5 = History button on the pill. Both discard the recording.
+if [ "$KEY_RC" -eq 4 ] || [ "$KEY_RC" -eq 5 ]; then
+  log_line "=== Recording ==="
+  log_line "Ended because: ${KEY_REASON:-unknown}"
+  log_line "Result: [cancelled]"
+  play_sound "$cancel_sound"
+  # On 5 the pill is already animating into the history window: leave it be.
+  [ "$KEY_RC" -eq 4 ] && show_status cancelled --timeout 1200
+  FINAL_OVERLAY=1
+  exit 0
+fi
+
+play_sound "$stop_sound"
+
 # Save clipboard for paste phase
 SAVED_CLIPBOARD=$($CLIP_PASTE 2>/dev/null)
 
@@ -974,7 +1062,8 @@ log_line "Ended because: ${KEY_REASON:-unknown}"
 # Check if recording is silent
 if is_silent "$RECORDING"; then
   log_line "Result: [silent — skipped]"
-  show_status silent --timeout 2000
+  # Longer than the other final pills: it carries the History button.
+  show_status silent --timeout 3500
   FINAL_OVERLAY=1
   rm -f "$RECORDING"
   exit 0
@@ -1015,6 +1104,7 @@ if [ "$OS" != "Darwin" ]; then
   done
 fi
 
+save_history "$TRANSCRIPTION"
 paste "$TRANSCRIPTION" "$IS_TERMINAL"
 
 # Show done overlay briefly — cleanup leaves it alone

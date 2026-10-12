@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""xhisper-history: the last dictations, newest first, each with a Copy button.
+
+Opened by `xhisper --history` or by the History chip on the overlay pill.
+Reads $XHISPER_HISTORY_FILE (JSON lines written by xhisper.sh, already trimmed
+to history-size). Only one window exists at a time: a second launch raises it.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta
+
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib, Gio
+except (ImportError, ValueError):
+    print("xhisper-history: PyGObject (GTK 3) is required", file=sys.stderr)
+    sys.exit(1)
+
+HISTORY_FILE = os.environ.get("XHISPER_HISTORY_FILE") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "xhisper", "history.jsonl")
+IS_WAYLAND = os.environ.get('XDG_SESSION_TYPE') == 'wayland'
+FADE_MS = 220
+SLIDE_PX = 24
+
+# Same palette as the overlay pill.
+CSS = b"""
+#xhisper-history { background-color: #1a1a1a; }
+#xhisper-history headerbar { background: #1a1a1a; border: none; box-shadow: none; }
+#xhisper-history .entry { background-color: #262626; border-radius: 12px; padding: 10px 12px; }
+#xhisper-history .when { color: #8f8b84; font-size: 11px; }
+#xhisper-history .text { color: #eeeae0; }
+#xhisper-history .empty { color: #8f8b84; }
+#xhisper-history button.copy { border-radius: 8px; min-width: 72px; }
+"""
+
+
+def load_entries():
+    entries = []
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("text"):
+                    entries.append(entry)
+    except OSError:
+        pass
+    return list(reversed(entries))
+
+
+def describe_time(stamp):
+    try:
+        when = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z").astimezone()
+    except (TypeError, ValueError):
+        return stamp or ""
+    today = datetime.now().astimezone().date()
+    if when.date() == today:
+        return "Today " + when.strftime("%H:%M")
+    if when.date() == today - timedelta(days=1):
+        return "Yesterday " + when.strftime("%H:%M")
+    return when.strftime("%d %b %H:%M")
+
+
+def copy_text(text):
+    """Copy with a helper that keeps owning the clipboard after we exit; GTK's
+    own clipboard would be emptied when this window closes."""
+    tools = [["wl-copy"]] if IS_WAYLAND else []
+    tools.append(["xclip", "-selection", "clipboard"])
+    for cmd in tools:
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode("utf-8"), timeout=3,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except (OSError, subprocess.SubprocessError):
+                pass
+    clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    clipboard.set_text(text, -1)
+    clipboard.store()
+
+
+class HistoryWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.set_name("xhisper-history")
+        self.set_default_size(560, 520)
+
+        header = Gtk.HeaderBar(title="Dictation history", show_close_button=True)
+        self.set_titlebar(header)
+
+        self.list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.list_box.set_margin_start(12)
+        self.list_box.set_margin_end(12)
+        self.list_box.set_margin_top(4)
+        self.list_box.set_margin_bottom(12)
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.add(self.list_box)
+        self.add(scroller)
+
+        self.connect("key-press-event", self.on_key)
+        self.populate()
+
+        # Refresh live when a new dictation lands while the window is open.
+        self.monitor = Gio.File.new_for_path(HISTORY_FILE).monitor_file(Gio.FileMonitorFlags.NONE, None)
+        self.monitor.connect("changed", self.on_file_changed)
+
+    def populate(self):
+        for child in self.list_box.get_children():
+            self.list_box.remove(child)
+        entries = load_entries()
+        self.first_button = None
+        if not entries:
+            empty = Gtk.Label(label="No dictations yet")
+            empty.get_style_context().add_class("empty")
+            empty.set_vexpand(True)
+            self.list_box.pack_start(empty, True, True, 0)
+        for entry in entries:
+            self.list_box.pack_start(self.make_row(entry), False, False, 0)
+        self.list_box.show_all()
+
+    def make_row(self, entry):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.get_style_context().add_class("entry")
+
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        when = Gtk.Label(label=describe_time(entry.get("time")), xalign=0)
+        when.get_style_context().add_class("when")
+        body = Gtk.Label(label=entry["text"], xalign=0, wrap=True, selectable=True)
+        body.set_line_wrap_mode(2)  # Pango.WrapMode.WORD_CHAR
+        body.set_max_width_chars(60)
+        body.get_style_context().add_class("text")
+        texts.pack_start(when, False, False, 0)
+        texts.pack_start(body, False, False, 0)
+        row.pack_start(texts, True, True, 0)
+
+        button = Gtk.Button(label="Copy", valign=Gtk.Align.CENTER)
+        button.get_style_context().add_class("copy")
+        button.connect("clicked", self.on_copy, entry["text"])
+        if self.first_button is None:
+            self.first_button = button
+        row.pack_end(button, False, False, 0)
+        return row
+
+    def on_copy(self, button, text):
+        copy_text(text)
+        button.set_label("Copied")
+        GLib.timeout_add(1200, lambda: button.set_label("Copy") or False)
+
+    def on_file_changed(self, _monitor, _file, _other, event):
+        if event in (Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
+                     Gio.FileMonitorEvent.DELETED):
+            self.populate()
+
+    def on_key(self, _widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
+
+    def widget_set_opacity(self, value):
+        Gtk.Widget.set_opacity(self, value)
+
+    def present_animated(self):
+        """Fade in and rise into place, picking up where the pill left off."""
+        self.widget_set_opacity(0.0)
+        target = None
+        if not IS_WAYLAND:
+            display = Gdk.Display.get_default()
+            monitor = display.get_primary_monitor() or display.get_monitor(0)
+            geom = monitor.get_geometry()
+            width, height = self.get_default_size()
+            target = (geom.x + (geom.width - width) // 2,
+                      geom.y + geom.height - height - 130)
+            self.move(target[0], target[1] + SLIDE_PX)
+        self.show_all()
+        self.present()
+        # Start on the newest Copy button (Enter copies the last dictation)
+        # rather than in a selectable label with a blinking caret.
+        if self.first_button:
+            self.first_button.grab_focus()
+        start = GLib.get_monotonic_time()
+
+        def step():
+            p = min(1.0, (GLib.get_monotonic_time() - start) / (FADE_MS * 1000))
+            eased = 1.0 - (1.0 - p) ** 3
+            self.widget_set_opacity(eased)
+            if target:
+                self.move(target[0], int(target[1] + SLIDE_PX * (1.0 - eased)))
+            return p < 1.0
+        GLib.timeout_add(16, step)
+
+
+class HistoryApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.abszar.xhisper.History")
+        self.window = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        # Selectable labels would otherwise select all their text when focused.
+        Gtk.Settings.get_default().set_property("gtk-label-select-on-focus", False)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        if self.window:
+            self.window.populate()
+            self.window.present()
+            return
+        self.window = HistoryWindow(self)
+        self.window.present_animated()
+
+
+if __name__ == "__main__":
+    sys.exit(HistoryApp().run(sys.argv))

@@ -11,7 +11,9 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 - **Linux and macOS** — Works on X11, Wayland, and macOS. Key release detection uses XQueryKeymap on X11, evdev on Wayland, and Quartz on macOS
 - **Push-to-talk** — Hold your shortcut key to record, release to transcribe. No double-press needed. A duplicate invocation while a recording is live is ignored (holding a key auto-repeats, and the desktop relaunches the command on every repeat); `xhisper --stop` ends a recording on purpose and can be bound to a second key
 - **Hands-free toggle (X11)** — With `xhisper-hotkey`, press Alt then Ctrl once to start recording and again to stop. No key to hold, and a modifier-only combo that GNOME shortcuts cannot bind
-- **Start sound** — Optional `start-sound` plays a short cue the moment recording starts
+- **Sound cues** — Optional `start-sound`, `stop-sound` and `cancel-sound` play when recording starts, stops, or is cancelled
+- **Escape to cancel** — Press Escape while recording to throw the recording away (on X11 the key is grabbed, so it does not also reach the focused app)
+- **Dictation history** — The last 20 dictations (`history-size`) are kept in a private file. Open them with `xhisper --history`, or with the **History** chip on the Recording / No sound pill; each one has a **Copy** button
 - **AI auto-editing** — Removes filler words and stutters, applies spoken self-corrections ("Tuesday, no wait, Wednesday"), turns "new line" into a real line break, and fixes punctuation — without ever rewriting your wording. If the model errors out, times out, or returns something suspicious, the raw transcription is pasted instead, so a bad API response never costs you a dictation
 - **Tone adaptation** — Detects the active window (Slack, Gmail, VS Code, etc.) and lets it influence punctuation and formatting — light for chat, full sentences for email, no Markdown in a terminal. It never changes your words or the length
 - **Personal dictionary** — Add custom words, names, and technical terms to `~/.config/xhisper/dictionary.txt` to improve Whisper's recognition accuracy
@@ -126,7 +128,8 @@ Notes:
   recording. Press Ctrl first for those.
 - Each press runs `xhisper --toggle`. Do not bind `--toggle` to a regular
   desktop shortcut: holding a key auto-repeats, and every repeat would toggle.
-- Set `start-sound` in `xhisperrc` to hear when recording starts.
+- Set `start-sound`, `stop-sound` and `cancel-sound` in `xhisperrc` for audio cues.
+- Press Escape to cancel a recording.
 - Remove the Pause binding above if you don't want both shortcuts.
 
 ---
@@ -195,12 +198,23 @@ running, press **Alt** then **Ctrl** once to start recording and once more to
 stop and transcribe. It runs `xhisper --toggle`, which records until the next
 `--toggle` (or `max-recording-seconds`).
 
+**Cancel:** press **Escape** while recording. The recording is discarded and
+`cancel-sound` plays.
+
+**History:** `xhisper --history` opens a window with your last dictations
+(newest first), each with a **Copy** button. The Recording and No sound pills
+also carry a **History** chip: clicking it while recording stops listening (like
+a cancel) and the pill slides into the history window. Kept: the last
+`history-size` dictations (default 20, `0` keeps none) in
+`~/.local/state/xhisper/history.jsonl`, readable only by you.
+
 An animated wave pill overlay slides up from the bottom of your screen showing the current state:
-- **Recording** — animated wave bars while you record (with an optional `start-sound` cue)
+- **Recording** — animated wave bars while you record (with an optional `start-sound` cue), plus a **History** chip
 - **Transcribing** — gentler pulse while Whisper processes your audio
 - **Editing** — AI is cleaning up your text
 - **Done** — brief confirmation, then fades out
-- **No sound** / **Failed** — nothing was recorded, or a step failed; run `xhisper --log` for the details
+- **No sound** / **Failed** — nothing was recorded, or a step failed; run `xhisper --log` for the details. No sound keeps the **History** chip, and stays up while your pointer is over it
+- **Cancelled** — you pressed Escape
 
 ```sh
 xhisper --help      # all options
