@@ -30,6 +30,21 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 
 ---
 
+## Platform support
+
+| Feature | Linux | macOS |
+|---|---|---|
+| Hold-to-talk dictation, paste at cursor | ✅ | ✅ |
+| AI auto-edit, tone adaptation, answer guard | ✅ | ✅ (shared code) |
+| Personal dictionary (Whisper hints + auto-edit vocabulary) | ✅ | ✅ (shared code) |
+| `--toggle` mode, Escape to cancel, sound cues | ✅ | ⏳ untested since added |
+| Alt → Ctrl toggle hotkey (`xhisper-hotkey`) | ✅ X11 | ⏳ needs a CGEventTap agent |
+| Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ⏳ needs a native panel (falls back to notifications) |
+| History window (`xhisper-history`) | ✅ | ⏳ needs a native window |
+| Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ⏳ needs the Accessibility API |
+
+Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.
+
 ## Installation on Ubuntu
 
 ### 1. Install dependencies
