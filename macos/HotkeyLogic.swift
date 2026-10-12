@@ -37,3 +37,17 @@ func isListener(_ argv: [String]) -> Bool {
     guard let first = argv.first else { return false }
     return (first as NSString).lastPathComponent.lowercased().hasPrefix("python")
 }
+
+/// What to do with an Escape event. Only a live key loop gets Escape eaten:
+/// a fresh press needs `listening`; a repeat continues an eaten press only
+/// while `swallowing` is set; the key-up is eaten to match its press.
+func escapeAction(keyDown: Bool, autorepeat: Bool, swallowing: Bool, listening: Bool)
+    -> (swallow: Bool, writeCancel: Bool, swallowingAfter: Bool) {
+    if keyDown {
+        if autorepeat && swallowing { return (true, false, true) }
+        if listening { return (true, true, true) }
+        return (false, false, false)
+    }
+    if swallowing { return (true, false, false) }
+    return (false, false, false)
+}

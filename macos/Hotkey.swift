@@ -17,8 +17,16 @@ enum Hotkey {
     static func log(_ message: String) { appendLine(Runtime.path("xhisper-hotkey.log"), message) }
 
     static func main(_ args: [String]) -> Int32 {
-        let lock = open(Runtime.path("xhisper-hotkey.lock"), O_CREAT | O_RDWR, 0o600)
-        guard lock >= 0, flock(lock, LOCK_EX | LOCK_NB) == 0 else { return 0 }  // already running
+        // O_CLOEXEC: dictations we launch must not inherit (and so outlive) the lock.
+        let lock = open(Runtime.path("xhisper-hotkey.lock"), O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        if lock < 0 {
+            log("cannot open the lock file (errno \(errno))")
+            return 1
+        }
+        guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
+            log("already running")
+            return 0
+        }
         signal(SIGCHLD, SIG_IGN)  // launched dictations are fire-and-forget
         if let cmd = ProcessInfo.processInfo.environment["XHISPER_CMD"], !cmd.isEmpty { command = cmd }
         log("starting (command: \(command))")
@@ -54,6 +62,7 @@ enum Hotkey {
     static func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            swallowingEscape = false  // a key-up may have been missed meanwhile
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
         case .flagsChanged:
             let f = event.flags
@@ -65,18 +74,17 @@ enum Hotkey {
             }
         case .keyDown, .keyUp:
             guard event.getIntegerValueField(.keyboardEventKeycode) == escapeKey else { break }
-            if type == .keyDown && (swallowingEscape || dictationListening()) {
-                if !swallowingEscape {
-                    FileManager.default.createFile(atPath: Runtime.path("xhisper.cancel"), contents: nil,
-                                                   attributes: [.posixPermissions: 0o600])
-                }
-                swallowingEscape = true  // its repeats and its key-up are ours too
-                return nil
+            let isDown = type == .keyDown
+            let repeating = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            // Only look for a live key loop on a fresh press.
+            let listening = isDown && !repeating && dictationListening()
+            let action = escapeAction(keyDown: isDown, autorepeat: repeating, swallowing: swallowingEscape, listening: listening)
+            swallowingEscape = action.swallowingAfter
+            if action.writeCancel {
+                FileManager.default.createFile(atPath: Runtime.path("xhisper.cancel"), contents: nil,
+                                               attributes: [.posixPermissions: 0o600])
             }
-            if type == .keyUp && swallowingEscape {
-                swallowingEscape = false
-                return nil
-            }
+            if action.swallow { return nil }
         default:
             break
         }

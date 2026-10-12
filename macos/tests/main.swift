@@ -104,6 +104,22 @@ check(isListener(["/Applications/Xcode.app/Contents/Developer/Library/Frameworks
 check(!isListener(["/usr/bin/vim"]), "recycled pid running something else")
 check(!isListener([]), "unreadable argv")
 
+// --- escapeAction (Escape only eaten while a key loop is live) ---
+let fresh = escapeAction(keyDown: true, autorepeat: false, swallowing: false, listening: true)
+check(fresh.swallow && fresh.writeCancel && fresh.swallowingAfter, "fresh press while listening: eat, write cancel")
+let rep = escapeAction(keyDown: true, autorepeat: true, swallowing: true, listening: false)
+check(rep.swallow && !rep.writeCancel && rep.swallowingAfter, "repeat while swallowing: eat, no second cancel")
+let stale = escapeAction(keyDown: true, autorepeat: false, swallowing: true, listening: false)
+check(!stale.swallow && !stale.writeCancel && !stale.swallowingAfter, "press not listening after stale flag: pass through")
+let idle = escapeAction(keyDown: true, autorepeat: false, swallowing: false, listening: false)
+check(!idle.swallow && !idle.writeCancel && !idle.swallowingAfter, "press while idle: pass through")
+let strayRepeat = escapeAction(keyDown: true, autorepeat: true, swallowing: false, listening: false)
+check(!strayRepeat.swallow && !strayRepeat.writeCancel, "repeat without swallowing: pass through")
+let up = escapeAction(keyDown: false, autorepeat: false, swallowing: true, listening: false)
+check(up.swallow && !up.writeCancel && !up.swallowingAfter, "key-up while swallowing: eat and clear")
+let upIdle = escapeAction(keyDown: false, autorepeat: false, swallowing: false, listening: true)
+check(!upIdle.swallow && !upIdle.writeCancel && !upIdle.swallowingAfter, "key-up of a passed press: pass through")
+
 try? FileManager.default.removeItem(atPath: tmpRoot)
 print(failures == 0 ? "selftest: all passed" : "selftest: \(failures) failed")
 exit(failures == 0 ? 0 : 1)
