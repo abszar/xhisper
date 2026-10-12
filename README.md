@@ -43,6 +43,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 | Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ✅ native panel |
 | History window (Copy, Edit) | ✅ | ✅ native window |
 | Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit; Terminal.app exposes its text (read check only); iTerm2: screen context ✅, learning watcher attaches (a correction there not yet tested). Chrome/Electron: not forced, same limit as Linux |
+| Smart spacing between dictations (`smart-spacing`) | ✅ AT-SPI (GTK field, Tilix; an unreadable field pastes unchanged) | ⏳ confirm with a hands-on test |
 | Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ✅ iTerm2 (tap, hold, Escape not reaching Claude Code); Terminal.app ⏳ untested |
 
 Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.
