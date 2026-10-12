@@ -9,6 +9,10 @@ import Foundation
 //   front    frontmost app: bundle id, name, window title
 //   paste    Cmd+V into the focused app
 
+// macOS otherwise quits the window/pill on its own (automatic termination).
+ProcessInfo.processInfo.disableAutomaticTermination("xhisper")
+ProcessInfo.processInfo.disableSuddenTermination()
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 let subcommand = arguments.first ?? "history"  // double-clicking the app opens the history
 let rest = Array(arguments.dropFirst())

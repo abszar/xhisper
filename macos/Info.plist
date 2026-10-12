@@ -20,6 +20,10 @@
 	<string>13.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>xhisper records your voice while you dictate.</string>
 </dict>

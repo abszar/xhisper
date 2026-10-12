@@ -159,8 +159,14 @@ final class HistoryController: NSObject, NSApplicationDelegate, NSTextViewDelega
         buttons.spacing = 6
 
         let content = NSStackView(views: [texts, buttons])
+        // Text takes the remaining width, buttons hug the right edge.
+        texts.setHuggingPriority(.defaultLow, for: .horizontal)
+        buttons.setHuggingPriority(.defaultHigh, for: .horizontal)
+        buttons.setContentCompressionResistancePriority(.required, for: .horizontal)
+        buttons.widthAnchor.constraint(equalToConstant: 72).isActive = true
         content.orientation = .horizontal
         content.alignment = .centerY
+        content.distribution = .fill
         content.spacing = 12
         content.translatesAutoresizingMaskIntoConstraints = false
         row.addSubview(content)
