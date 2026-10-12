@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""xhisper-learn: teach xhisper your own words from the corrections you make.
+
+Learned words go to ~/.config/xhisper/dictionary.txt, which xhisper passes to
+Whisper as spelling hints and to the auto-edit model as vocabulary.
+
+  xhisper-learn add WORD...     add words yourself
+  xhisper-learn remove WORD...  forget words
+  xhisper-learn list            print the dictionary
+  xhisper-learn diff            stdin {"old": ..., "new": ...}: learn from an
+                                edit (used by the History window); prints the
+                                words it learned
+  xhisper-learn watch           stdin: the text just pasted. Follows the focused
+                                text field through AT-SPI for a minute and
+                                learns the words you correct in it
+
+A word is learned only when it *replaces* dictated words (typing more text is
+not a correction) and is not an ordinary English word. Lowercase words must
+also be a real change of word ("Qulify" -> "coolify"), not a spelling touch-up
+("reporte" -> "reportée"), so typo and accent fixes teach nothing.
+"""
+
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "xhisper")
+DICTIONARY_FILE = os.path.join(CONFIG_DIR, "dictionary.txt")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "xhisperrc")
+LEARNED_PILL_MS = 6000  # time to reach the Unlearn button (more while hovered)
+RUNTIME_DIR = os.environ.get("XHISPER_RUNTIME_DIR") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "xhisper")
+WATCH_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper-learn.pid")
+XHISPER_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper.pid")
+WORD_LIST = "/usr/share/dict/words"
+
+WATCH_SECONDS = 60
+POLL_SECONDS = 0.5
+SETTLE_SECONDS = 3.0      # a correction must sit unchanged this long (or be sent)
+MAX_REPLACEMENT_WORDS = 4  # longer rewrites are edits, not corrections
+
+WORD_RE = re.compile(r"\w(?:[\w'’.+#-]*\w)?")
+
+
+def tokenize(text):
+    return WORD_RE.findall(text)
+
+
+def load_dictionary():
+    words = []
+    try:
+        with open(DICTIONARY_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    words.append(line)
+    except OSError:
+        pass
+    return words
+
+
+_english = None
+
+
+def english_words():
+    global _english
+    if _english is None:
+        try:
+            with open(WORD_LIST, encoding="utf-8", errors="replace") as f:
+                _english = {w.strip().lower() for w in f}
+        except OSError:
+            _english = set()
+    return _english
+
+
+LOWERCASE_MAX_SIMILARITY = 0.8
+
+
+def plain(text):
+    """Lowercase without accents: 'Réunion' -> 'reunion'."""
+    decomposed = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def is_candidate(word, known, replaced=None):
+    """Worth learning? `replaced` is the dictated text the word took over from.
+
+    Names with a capital or a digit (TOSIAM, GraphQL, k8s) only need to be
+    unusual. All-lowercase words (coolify, kubectl) must also differ enough
+    from what they replaced: there is only an English word list here, so a
+    French accent or one-letter fix would otherwise be learned."""
+    if len(word) < 2 or word in known or word.lower() in english_words():
+        return False
+    if any(c.isupper() or c.isdigit() for c in word):
+        return True
+    if not replaced:
+        return False
+    a, b = plain(replaced).replace(" ", ""), plain(word)
+    return a != b and difflib.SequenceMatcher(None, a, b).ratio() < LOWERCASE_MAX_SIMILARITY
+
+
+def merged(word, replaced):
+    """True for an editing slip that glued a dictated word onto the fix, like
+    "using QLIFY" -> "usingcoolifyY" (the space got deleted)."""
+    low = word.lower()
+    if low == "".join(replaced).lower():
+        return False  # "graph QL" -> "GraphQL": joining the split word is the fix
+    return any(len(r) >= 3 and r.lower() != low and r.lower() in english_words()
+               and (low.startswith(r.lower()) or low.endswith(r.lower()))
+               for r in replaced)
+
+
+def corrections(old_words, new_words):
+    """Words in new_words that replace (not merely extend) old_words."""
+    known = set(load_dictionary())
+    found = []
+    matcher = difflib.SequenceMatcher(None, [w.lower() for w in old_words],
+                                      [w.lower() for w in new_words], autojunk=False)
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "equal":
+            # Same word ignoring case: a casing fix (tosiam -> TOSIAM) counts.
+            pairs = zip(old_words[i1:i2], new_words[j1:j2])
+            found += [new for old, new in pairs if old != new and is_candidate(new, known)]
+        elif op == "replace" and j2 - j1 <= MAX_REPLACEMENT_WORDS:
+            replaced = old_words[i1:i2]
+            found += [w for w in new_words[j1:j2]
+                      if w not in replaced and not merged(w, replaced)
+                      and is_candidate(w, known, " ".join(replaced))]
+    return list(dict.fromkeys(found))
+
+
+def add_words(words):
+    """Append the words not yet in the dictionary; return the ones added."""
+    known = set(load_dictionary())
+    new = [w for w in dict.fromkeys(words) if w and w not in known]
+    if not new:
+        return []
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    fresh = not os.path.exists(DICTIONARY_FILE)
+    with open(DICTIONARY_FILE, "a", encoding="utf-8") as f:
+        if fresh:
+            f.write("# xhisper personal dictionary: one word or phrase per line.\n")
+        for w in new:
+            f.write(w + "\n")
+    return new
+
+
+def remove_words(words):
+    gone = set(words)
+    try:
+        with open(DICTIONARY_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    kept = [l for l in lines if l.strip() not in gone]
+    with open(DICTIONARY_FILE + ".tmp", "w", encoding="utf-8") as f:
+        f.writelines(kept)
+    os.replace(DICTIONARY_FILE + ".tmp", DICTIONARY_FILE)
+    return [w for w in words if any(l.strip() == w for l in lines)]
+
+
+def sibling(name):
+    path = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), name)
+    return path if os.access(path, os.X_OK) else name
+
+
+def dictation_running():
+    try:
+        with open(XHISPER_PID_FILE) as f:
+            os.kill(int(f.read().split()[0]), 0)
+        return True
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def config_value(key):
+    """One `key : value` from xhisperrc, parsed like xhisper.sh does (trims
+    whitespace and surrounding quotes, drops a trailing ' # comment')."""
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            for line in f:
+                name, sep, value = line.partition(":")
+                if not sep or name.strip() != key:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                    return value[1:-1]
+                return value.split(" #", 1)[0].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def play(sound):
+    if not sound or not os.path.isfile(sound):
+        return
+    for player in ("paplay", "pw-play"):
+        try:
+            subprocess.Popen([player, sound], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return
+        except OSError:
+            continue
+
+
+def announce(words):
+    """Achievement sound and a "Learned: WORD" pill with an Unlearn button."""
+    # Never take over the pill while a dictation is showing its own state.
+    if not words or dictation_running():
+        return
+    play(config_value("learned-sound"))
+    try:
+        subprocess.Popen([sibling("xhisper-notify"), "learned", "--label", "Learned: " + ", ".join(words),
+                          "--unlearn", ",".join(words), "--timeout", str(LEARNED_PILL_MS)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+# ----- AT-SPI watcher -----------------------------------------------------
+
+def active_window_pid():
+    """PID of the focused X11 window, or None (Wayland, no xdotool)."""
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        return None
+    try:
+        out = subprocess.run(["xdotool", "getactivewindow", "getwindowpid"],
+                             capture_output=True, timeout=2).stdout.decode().strip()
+        return int(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def focused_text_node(Atspi):
+    """The focused accessible with a Text interface in the active window.
+
+    AT-SPI's ACTIVE state is unreliable on its own (a backgrounded Chrome and
+    mutter's frame windows both keep claiming it), so on X11 the app is picked
+    by the PID of the window the X server says is focused. Without that, a
+    focused field that has a caret is preferred."""
+    pid = active_window_pid()
+    desktop = Atspi.get_desktop(0)
+    fallback = None
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        if app is None:
+            continue
+        try:
+            if pid is not None and app.get_process_id() != pid:
+                continue
+        except Exception:
+            continue
+        for j in range(app.get_child_count()):
+            win = app.get_child_at_index(j)
+            try:
+                if not win.get_state_set().contains(Atspi.StateType.ACTIVE):
+                    continue
+            except Exception:
+                continue
+            stack, seen = [win], 0
+            while stack and seen < 20000:
+                node = stack.pop()
+                seen += 1
+                try:
+                    if node.get_state_set().contains(Atspi.StateType.FOCUSED):
+                        if node.get_text_iface() is None:
+                            break
+                        if pid is not None or Atspi.Text.get_caret_offset(node) >= 0:
+                            return node
+                        fallback = fallback or node
+                        break
+                    stack.extend(node.get_child_at_index(k) for k in range(node.get_child_count()))
+                except Exception:
+                    continue
+    return fallback
+
+
+def locate(target, text, caret=-1):
+    """The words of the dictated text as they now stand in `text`, or None.
+
+    Fuzzy, so line wrapping, terminal redraws and the user's own edits do not
+    lose track of it. Only the text around the caret is searched - the user
+    edits where the caret is - and the copy containing the caret wins over an
+    older verbatim copy elsewhere on the page."""
+    size = len(target)
+    reach = 3 * sum(len(w) + 1 for w in target) + 200
+    if caret is None or caret < 0:
+        caret = len(text)
+    lo = max(0, caret - reach)
+    part = text[lo:caret + reach]
+    caret -= lo
+    found = list(WORD_RE.finditer(part))
+    words = [f.group() for f in found]
+    tl = [w.lower() for w in target]
+    tset = set(tl)
+    lw = [w.lower() for w in words]
+    # Just longer than the dictation: a wider window would reach into a
+    # neighbouring copy and lock onto it.
+    span = size + max(2, size // 5)
+    best_key, best = None, None
+    for start in range(len(lw)):
+        if lw[start] not in tset:
+            continue  # a match starts on a dictated word (or its replacement's neighbour)
+        matcher = difflib.SequenceMatcher(None, tl, lw[start:start + span], autojunk=False)
+        blocks = [b for b in matcher.get_matching_blocks() if b.size]
+        score = sum(b.size for b in blocks)
+        if score < 0.6 * size:
+            continue
+        first, last = blocks[0], blocks[-1]
+        begin = start + max(0, first.b - first.a)
+        end = min(len(words), start + last.b + last.size + (size - last.a - last.size))
+        if end <= begin or end - begin > size + size // 2 + 3:
+            continue
+        lo_c, hi_c = found[begin].start(), found[end - 1].end()
+        distance = 0 if lo_c <= caret <= hi_c else min(abs(caret - lo_c), abs(caret - hi_c))
+        key = (-distance, score)
+        if best_key is None or key > best_key:
+            best_key, best = key, words[begin:end]
+    return best
+
+
+def log(message):
+    """One line in xhisper's log (`xhisper --log`). Never the dictated text:
+    only what was watched, which words were seen as fixes and learned."""
+    try:
+        with open(os.path.join(RUNTIME_DIR, "xhisper.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%H:%M:%S] ") + "Learn: " + message + "\n")
+    except OSError:
+        pass
+
+
+def watch(pasted):
+    target = tokenize(pasted)
+    if not target:
+        return
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+    except (ImportError, ValueError):
+        log("AT-SPI (gir1.2-atspi-2.0) unavailable, not watching")
+        return
+    time.sleep(0.3)  # let the paste land
+    node = focused_text_node(Atspi)
+    if node is None:
+        log("no readable text field in the focused window, not watching")
+        return
+    log("watching a %s for %ds" % (node.get_role_name(), WATCH_SECONDS))
+    pending, since, seen, done = [], 0.0, 0, set()
+    located = False
+    deadline = time.time() + WATCH_SECONDS
+    while time.time() < deadline:
+        time.sleep(POLL_SECONDS)
+        try:
+            text = Atspi.Text.get_text(node, 0, -1)
+            caret = Atspi.Text.get_caret_offset(node)
+        except Exception:
+            log("field went away")
+            return
+        region = locate(target, text, caret)
+        if region is None:
+            # The dictation left the field with a fix pending: most likely it
+            # was sent (Enter in a chat or terminal prompt) right after the fix,
+            # before it could settle. Keep it only if it was seen on two polls
+            # in a row, so a word caught half-typed is never learned.
+            if pending and seen >= 2:
+                log("text left the field (sent?) with fix pending: " + ", ".join(pending))
+                learned = add_words(pending)
+                log("learned: " + (", ".join(learned) or "nothing new"))
+                announce(learned)
+                done.update(pending)
+            elif pending:
+                log("text left the field before the fix was stable, not learned")
+            pending, seen = [], 0
+            if located:
+                log("lost track of the dictation")
+                located = False
+            continue
+        if not located:
+            log("found the dictation in the field")
+            located = True
+        found = [w for w in corrections(target, region) if w not in done]
+        if found != pending:
+            pending, since, seen = found, time.time(), 1
+            if found:
+                log("fix seen: " + ", ".join(found))
+            continue
+        seen += 1
+        if pending and time.time() - since >= SETTLE_SECONDS:
+            learned = add_words(pending)
+            log("learned: " + (", ".join(learned) or "nothing new"))
+            announce(learned)
+            done.update(pending)
+            pending, seen = [], 0
+    log("done watching")
+
+
+def claim_watch_slot():
+    """One watcher at a time: a new dictation replaces the previous watcher."""
+    try:
+        with open(WATCH_PID_FILE) as f:
+            old = int(f.read().strip())
+        if old != os.getpid():
+            os.kill(old, 15)
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(WATCH_PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def release_watch_slot():
+    try:
+        with open(WATCH_PID_FILE) as f:
+            if int(f.read().strip()) == os.getpid():
+                os.unlink(WATCH_PID_FILE)
+    except (OSError, ValueError):
+        pass
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "add":
+        for w in add_words(args):
+            print(w)
+    elif cmd == "remove":
+        for w in remove_words(args):
+            print(w)
+    elif cmd == "list":
+        for w in load_dictionary():
+            print(w)
+    elif cmd == "diff":
+        data = json.load(sys.stdin)
+        learned = add_words(corrections(tokenize(data.get("old", "")), tokenize(data.get("new", ""))))
+        for w in learned:
+            print(w)
+    elif cmd == "watch":
+        pasted = sys.stdin.read()
+        claim_watch_slot()
+        try:
+            watch(pasted)
+        finally:
+            release_watch_slot()
+    else:
+        print(f"xhisper-learn: unknown command '{cmd}'", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

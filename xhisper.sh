@@ -7,6 +7,7 @@
 # a stop shortcut). A duplicate invocation of the hotkey itself is ignored,
 # because holding a key auto-repeats and the desktop relaunches on every repeat.
 # Escape cancels a live recording. `xhisper --history` shows past dictations.
+# With learn-words, corrections made after a paste teach new words (xhisper-learn).
 # `xhisper --toggle` is the press-once mode: it records until the next
 # `--toggle`. Only use it from a trigger that fires once per press
 # (xhisper-hotkey), never from a plain desktop shortcut.
@@ -38,6 +39,7 @@ chmod 700 "$RUNTIME_DIR" 2>/dev/null
 export XHISPER_RUNTIME_DIR="$RUNTIME_DIR"
 
 RECORDING="$RUNTIME_DIR/xhisper.wav"
+export XHISPER_RECORDING="$RECORDING"  # the overlay reads its tail for the live level meter
 LOGFILE="$RUNTIME_DIR/xhisper.log"
 PIDFILE="$RUNTIME_DIR/xhisper.pid"
 STOPFILE="$RUNTIME_DIR/xhisper.stop"
@@ -141,11 +143,13 @@ if [ "$LOCAL_MODE" -eq 1 ]; then
   XHISPERTOOLD="$SCRIPT_DIR/xhispertoold"
   XHISPER_NOTIFY="$SCRIPT_DIR/xhisper-notify"
   XHISPER_HISTORY="$SCRIPT_DIR/xhisper-history"
+  XHISPER_LEARN="$SCRIPT_DIR/xhisper-learn"
 else
   XHISPERTOOL="xhispertool"
   XHISPERTOOLD="xhispertoold"
   XHISPER_NOTIFY="xhisper-notify"
   XHISPER_HISTORY="xhisper-history"
+  XHISPER_LEARN="xhisper-learn"
 fi
 
 if [ "$HISTORY_MODE" -eq 1 ]; then
@@ -170,6 +174,7 @@ start_sound=""
 stop_sound=""
 cancel_sound=""
 history_size=20
+learn_words="false"
 stt_url="https://api.groq.com/openai/v1"
 stt_api_key=""
 stt_model=""
@@ -217,6 +222,7 @@ if [ -f "$CONFIG_FILE" ]; then
       stop-sound) stop_sound="$value" ;;
       cancel-sound) cancel_sound="$value" ;;
       history-size) history_size="$value" ;;
+      learn-words) learn_words="$value" ;;
       stt-url) stt_url="$value" ;;
       stt-api-key) stt_api_key="$value" ;;
       stt-model) stt_model="$value" ;;
@@ -235,7 +241,7 @@ fi
 
 # Load personal dictionary into transcription prompt
 if [ -f "$DICTIONARY_FILE" ]; then
-  dict_words=$(grep -v '^#' "$DICTIONARY_FILE" | grep -v '^[[:space:]]*$' | tr '\n' ', ' | sed 's/,$//')
+  dict_words=$(grep -v '^#' "$DICTIONARY_FILE" | grep -v '^[[:space:]]*$' | paste -sd ',' - | sed 's/,/, /g')
   if [ -n "$dict_words" ]; then
     if [ -n "$transcription_prompt" ]; then
       transcription_prompt="$transcription_prompt, $dict_words"
@@ -279,6 +285,11 @@ if [ -f "$PIDFILE" ]; then
 fi
 rm -f "$STOPFILE" "$HISTORYFLAG"
 printf '%s %s\n' "$$" "$(date +%s)" > "$PIDFILE"
+# A new dictation ends the correction watcher of the previous one.
+if [ -f "$RUNTIME_DIR/xhisper-learn.pid" ]; then
+  kill "$(cat "$RUNTIME_DIR/xhisper-learn.pid" 2>/dev/null)" 2>/dev/null
+  rm -f "$RUNTIME_DIR/xhisper-learn.pid"
+fi
 
 log_line() {
   printf '%s\n' "$1" >> "$LOGFILE"
@@ -627,6 +638,7 @@ get_tone_for_window() {
 # contain apostrophes, quotes and newlines without any escaping.
 build_edit_prompt() {
   local tone="$1"
+  local vocabulary="$2"
   cat <<'PROMPT_EOF'
 You are a dictation cleanup filter inside a speech-to-text tool. You receive one raw transcript of what the user just dictated, and you return that same message cleaned up, ready to be pasted at their cursor. You are never the recipient of the message and you never talk to the user.
 
@@ -665,6 +677,11 @@ PROMPT_EOF
   if [ -n "$tone" ]; then
     printf '\nCONTEXT: the text will be inserted into %s. Let that influence punctuation and formatting only, never the wording or the length.\n' "$tone"
   fi
+  # The personal dictionary (including words learned from corrections), so a
+  # misheard name such as "to Ziam" comes back as the user's spelling.
+  if [ -n "$vocabulary" ]; then
+    printf '\nVOCABULARY: the speaker'"'"'s own names and terms, spelled exactly like this: %s. Speech recognition often mishears them as one or more ordinary-looking words (for example "Kubernetes" heard as "cooper netties"). When a group of words is such a mishearing and makes no sense as ordinary words in the sentence, replace the whole group with the vocabulary spelling. Ordinary words that make sense stay as they are, and a vocabulary term is never inserted anywhere else.\n' "$vocabulary"
+  fi
 }
 
 auto_edit_text() {
@@ -674,7 +691,7 @@ auto_edit_text() {
   logging_start=$(now_seconds)
 
   local system_prompt
-  system_prompt=$(build_edit_prompt "$tone")
+  system_prompt=$(build_edit_prompt "$tone" "$dict_words")
 
   # Body goes through a file in the 0700 runtime dir: it keeps the transcript
   # out of `ps` and leaves stdin free for the auth header.
@@ -1106,6 +1123,12 @@ fi
 
 save_history "$TRANSCRIPTION"
 paste "$TRANSCRIPTION" "$IS_TERMINAL"
+
+# Watch the field for a minute and learn the words the user corrects in it.
+# The text goes over stdin, never argv, so it stays out of `ps`.
+if [ "$learn_words" = "true" ] && [ "$OS" != "Darwin" ] && command -v "$XHISPER_LEARN" > /dev/null; then
+  printf '%s' "$TRANSCRIPTION" | "$XHISPER_LEARN" watch > /dev/null 2>&1 &
+fi
 
 # Show done overlay briefly — cleanup leaves it alone
 show_status done --timeout 1500

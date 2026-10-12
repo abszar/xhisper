@@ -27,11 +27,22 @@ max-recording-seconds    : 300
 start-sound              :
 stop-sound               :
 cancel-sound             :
+learned-sound            :    # played with the "Learned: WORD" pill (see learn-words)
 
 # History:
 # Number of past dictations kept for 'xhisper --history' and the History chip
 # on the overlay (0 = keep none). Stored 0600 in ~/.local/state/xhisper/.
 history-size             : 20
+
+# Learning:
+# After each paste, follow the text field for a minute (Linux accessibility,
+# AT-SPI) and learn the words you correct in it - e.g. fix "to Ziam" into
+# "TOSIAM" once and it goes into dictionary.txt. Only replaced words that are
+# not ordinary English are learned, and lowercase ones only when the fix is a
+# real change of word, not a typo or accent fix. Editing a
+# dictation in the History window teaches the same way. Reads the focused
+# field's text in memory only; nothing is stored but the learned words.
+learn-words              : false
 
 # Silence Detection:
 # Recordings whose peak volume stays under this many dB are discarded.

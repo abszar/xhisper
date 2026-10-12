@@ -11,12 +11,14 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 - **Linux and macOS** — Works on X11, Wayland, and macOS. Key release detection uses XQueryKeymap on X11, evdev on Wayland, and Quartz on macOS
 - **Push-to-talk** — Hold your shortcut key to record, release to transcribe. No double-press needed. A duplicate invocation while a recording is live is ignored (holding a key auto-repeats, and the desktop relaunches the command on every repeat); `xhisper --stop` ends a recording on purpose and can be bound to a second key
 - **Hands-free toggle (X11)** — With `xhisper-hotkey`, press Alt then Ctrl once to start recording and again to stop. No key to hold, and a modifier-only combo that GNOME shortcuts cannot bind
-- **Sound cues** — Optional `start-sound`, `stop-sound` and `cancel-sound` play when recording starts, stops, or is cancelled
+- **Sound cues** — Optional `start-sound`, `stop-sound`, `cancel-sound` and `learned-sound` play when recording starts, stops, is cancelled, or a word is learned
 - **Escape to cancel** — Press Escape while recording to throw the recording away (on X11 the key is grabbed, so it does not also reach the focused app)
+- **Live waveform** — While recording, the pill's bars follow your voice (they read the level of the audio being recorded), and drop to dots when you pause
+- **Learns your words** — Fix a misheard name once ("to Ziam" → "TOSIAM") right where it was pasted, or in the History window, and xhisper adds it to your dictionary. Learned words are sent to Whisper as spelling hints and to the auto-edit model as vocabulary
 - **Dictation history** — The last 20 dictations (`history-size`) are kept in a private file. Open them with `xhisper --history`, or with the **History** chip on the Recording / No sound pill; each one has a **Copy** button
 - **AI auto-editing** — Removes filler words and stutters, applies spoken self-corrections ("Tuesday, no wait, Wednesday"), turns "new line" into a real line break, and fixes punctuation — without ever rewriting your wording. If the model errors out, times out, or returns something suspicious, the raw transcription is pasted instead, so a bad API response never costs you a dictation
 - **Tone adaptation** — Detects the active window (Slack, Gmail, VS Code, etc.) and lets it influence punctuation and formatting — light for chat, full sentences for email, no Markdown in a terminal. It never changes your words or the length
-- **Personal dictionary** — Add custom words, names, and technical terms to `~/.config/xhisper/dictionary.txt` to improve Whisper's recognition accuracy
+- **Personal dictionary** — Add custom words, names, and technical terms to `~/.config/xhisper/dictionary.txt` (or `xhisper-learn add WORD`) to improve Whisper's recognition accuracy; the auto-edit model gets them too, so near-misses are respelled
 - **Animated status overlay** — A dark pill with animated sound wave bars slides up from the bottom of the screen during recording, transcribing, and editing (falls back to desktop notifications if GTK is unavailable)
 - **Smart paste** — Detects the active window *class* and uses the correct paste shortcut (Ctrl+V, Ctrl+Shift+V for terminals on Linux; Cmd+V, Cmd+Shift+V on macOS). Works natively with AZERTY, QWERTZ, or any keyboard layout
 - **Multi-language transcription** — Whisper auto-detects the spoken language by default, so you can switch between English, French, Spanish, etc. and each is transcribed in its own script. Set `language : en` (or any ISO 639-1 code) in the config to force a specific language
@@ -206,15 +208,31 @@ stop and transcribe. It runs `xhisper --toggle`, which records until the next
 also carry a **History** chip: clicking it while recording stops listening (like
 a cancel) and the pill slides into the history window. Kept: the last
 `history-size` dictations (default 20, `0` keeps none) in
-`~/.local/state/xhisper/history.jsonl`, readable only by you.
+`~/.local/state/xhisper/history.jsonl`, readable only by you. **Edit** fixes a
+dictation in place and learns the words you corrected.
+
+**Learning words:** with `learn-words : true`, xhisper follows the field it
+pasted into for a minute (through Linux accessibility, AT-SPI). Replace a
+misheard word there — say "to Ziam" with "TOSIAM" — and once the fix has sat
+for three seconds (or is sent with Enter), the new word is added to your
+dictionary. A *Learned: WORD* pill confirms it, with an optional
+`learned-sound`; it stays about six seconds (longer while your pointer is on
+it) and its **Unlearn** button takes the word back out if the fix was a
+mistake. Only words that replace dictated words and are not ordinary
+English are learned; an all-lowercase word must also be a real change of word
+("Qulify" → "coolify"), so typo and accent fixes teach nothing. It works where the app exposes its text (GTK apps, terminals such as
+Tilix/GNOME Terminal, Firefox; Chrome and Electron apps only with accessibility
+on). The text is read in memory only; only learned words are stored. Manage
+the list with `xhisper-learn list | add WORD | remove WORD`.
 
 An animated wave pill overlay slides up from the bottom of your screen showing the current state:
-- **Recording** — animated wave bars while you record (with an optional `start-sound` cue), plus a **History** chip
+- **Recording** — wave bars that follow your voice (with an optional `start-sound` cue), plus a **History** chip
 - **Transcribing** — gentler pulse while Whisper processes your audio
 - **Editing** — AI is cleaning up your text
 - **Done** — brief confirmation, then fades out
 - **No sound** / **Failed** — nothing was recorded, or a step failed; run `xhisper --log` for the details. No sound keeps the **History** chip, and stays up while your pointer is over it
 - **Cancelled** — you pressed Escape
+- **Learned: WORD** — a correction you made taught xhisper a new word; click **Unlearn** to undo it
 
 ```sh
 xhisper --help      # all options
