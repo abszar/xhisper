@@ -37,8 +37,24 @@ CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduse
 DICTIONARY_FILE = os.path.join(CONFIG_DIR, "dictionary.txt")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "xhisperrc")
 LEARNED_PILL_MS = 6000  # time to reach the Unlearn button (more while hovered)
-RUNTIME_DIR = os.environ.get("XHISPER_RUNTIME_DIR") or os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "xhisper")
+
+
+def runtime_dir():
+    """Same rule as xhisper.sh: XHISPER_RUNTIME_DIR, else XDG_RUNTIME_DIR/xhisper,
+    else (macOS) the per-user temp dir + xhisper, else /tmp/xhisper."""
+    if os.environ.get("XHISPER_RUNTIME_DIR"):
+        return os.environ["XHISPER_RUNTIME_DIR"]
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base and sys.platform == "darwin":
+        try:
+            # _CS_DARWIN_USER_TEMP_DIR; python has no name for it.
+            base = os.confstr(65537).rstrip("/")
+        except (ValueError, OSError):
+            base = None
+    return os.path.join(base or "/tmp", "xhisper")
+
+
+RUNTIME_DIR = runtime_dir()
 WATCH_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper-learn.pid")
 XHISPER_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper.pid")
 WORD_LIST = "/usr/share/dict/words"
@@ -407,6 +423,11 @@ class AxReader:
         except (OSError, ValueError):
             return None
 
+    @property
+    def denied(self):
+        """Xhisper.app itself lacks the Accessibility permission."""
+        return bool(self.first.get("denied"))
+
     def role(self):
         return self.first.get("role") or "text field"
 
@@ -506,7 +527,10 @@ def watch(pasted):
     try:
         time.sleep(0.3)  # let the paste land
         if not reader.attach():
-            log("no readable text field in the focused window, not watching")
+            if getattr(reader, "denied", False):
+                log("Xhisper.app lacks Accessibility (System Settings > Privacy & Security > Accessibility), not watching")
+            else:
+                log("no readable text field in the focused window, not watching")
             return
         log("watching a %s for %ds" % (reader.role(), WATCH_SECONDS))
         follow(reader, target)

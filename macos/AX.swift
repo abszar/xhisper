@@ -56,6 +56,9 @@ enum AXCommand {
     }
 
     static func emit(_ object: [String: Any]) {
+        var object = object
+        // Tell xhisper-learn why nothing was readable (it logs a permission hint).
+        if !AXIsProcessTrusted() { object["denied"] = true }
         let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
         FileHandle.standardOutput.write(data + Data("\n".utf8))
     }

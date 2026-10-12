@@ -236,9 +236,13 @@ final class HistoryController: NSObject, NSApplicationDelegate, NSTextViewDelega
         editing = nil
         let newText = view.string.trimmingCharacters(in: .whitespacesAndNewlines)
         if save && !newText.isEmpty && newText != entry.text {
-            let learned = learnFromEdit(old: entry.text, new: newText)
-            HistoryStore.update(path, entry: entry, newText: newText)
-            window.subtitle = learned.isEmpty ? "Saved" : "Learned: " + learned.joined(separator: ", ")
+            // Save first: a failing xhisper-learn must not lose the edit.
+            if HistoryStore.update(path, entry: entry, newText: newText) {
+                let learned = learnFromEdit(old: entry.text, new: newText)
+                window.subtitle = learned.isEmpty ? "Saved" : "Learned: " + learned.joined(separator: ", ")
+            } else {
+                window.subtitle = "Could not save"
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { self.window.subtitle = "" }
         }
         stale = false
@@ -257,7 +261,7 @@ final class HistoryController: NSObject, NSApplicationDelegate, NSTextViewDelega
         p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil,
               let body = try? JSONSerialization.data(withJSONObject: ["old": old, "new": new]) else { return [] }
-        input.fileHandleForWriting.write(body)
+        try? input.fileHandleForWriting.write(contentsOf: body)  // EPIPE if it died: ignored
         try? input.fileHandleForWriting.close()
         let deadline = Date().addingTimeInterval(10)
         while p.isRunning && Date() < deadline { usleep(20_000) }
@@ -308,6 +312,7 @@ enum HistoryApp {
         let controller = HistoryController()
         app.delegate = controller
         signal(SIGUSR1, SIG_IGN)
+        signal(SIGPIPE, SIG_IGN)  // a dying xhisper-learn must not take the window down
         let raise = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
         raise.setEventHandler { controller.raise() }
         raise.resume()

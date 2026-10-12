@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -138,6 +139,68 @@ class AxReaderProtocol(unittest.TestCase):
         os.environ["XHISPER_APP"] = "/nonexistent/Xhisper"
         with self.assertRaises(ImportError):
             learn.AxReader()
+
+    def test_denied(self):
+        with open(self.fake, "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import sys, json\n"
+                    "for _ in sys.stdin:\n"
+                    "    print(json.dumps({'denied': True}), flush=True)\n")
+        reader = learn.AxReader()
+        try:
+            self.assertFalse(reader.attach())  # no text field readable
+            self.assertTrue(reader.denied)
+        finally:
+            reader.close()
+
+    def test_watch_logs_denied_hint(self):
+        with open(self.fake, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys, json\n"
+                    "for _ in sys.stdin:\n    print(json.dumps({'denied': True}), flush=True)\n")
+        logged = []
+        old = learn.log
+        learn.log = logged.append
+        try:
+            learn.watch("some dictated words")
+        finally:
+            learn.log = old
+        self.assertEqual(len(logged), 1)
+        self.assertIn("lacks Accessibility", logged[0])
+        self.assertNotIn("dictated", logged[0])
+
+    def test_not_denied(self):
+        reader = learn.AxReader()
+        try:
+            self.assertTrue(reader.attach())
+            self.assertFalse(reader.denied)
+        finally:
+            reader.close()
+
+
+class RuntimeDir(unittest.TestCase):
+    """xhisper-learn finds the same runtime dir as xhisper.sh."""
+
+    def fresh(self, **env):
+        saved = {k: os.environ.pop(k, None) for k in ("XHISPER_RUNTIME_DIR", "XDG_RUNTIME_DIR")}
+        os.environ.update(env)
+        try:
+            return load().RUNTIME_DIR
+        finally:
+            for k in ("XHISPER_RUNTIME_DIR", "XDG_RUNTIME_DIR"):
+                os.environ.pop(k, None)
+                if saved[k] is not None:
+                    os.environ[k] = saved[k]
+
+    def test_explicit_wins(self):
+        self.assertEqual(self.fresh(XHISPER_RUNTIME_DIR="/x/y", XDG_RUNTIME_DIR="/z"), "/x/y")
+
+    def test_xdg(self):
+        self.assertEqual(self.fresh(XDG_RUNTIME_DIR="/run/user/1"), "/run/user/1/xhisper")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS per-user temp dir")
+    def test_darwin_default(self):
+        tmp = subprocess.check_output(["getconf", "DARWIN_USER_TEMP_DIR"], text=True).strip()
+        self.assertEqual(self.fresh(), tmp.rstrip("/") + "/xhisper")
 
 
 if __name__ == "__main__":
