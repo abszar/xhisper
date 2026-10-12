@@ -132,3 +132,10 @@ func scalarOffset(_ s: String, utf16 offset: Int) -> Int {
     let units = Array(s.utf16.prefix(offset))
     return String(decoding: units, as: UTF16.self).unicodeScalars.count
 }
+
+/// Web content (Chrome, Electron) reports the caret on an empty last line just
+/// before the newline that opened it; the caret is really after it.
+func webCaretOnEmptyLastLine(_ caret: Int, selection: Int, utf16: [UInt16], isWeb: Bool) -> Int {
+    guard isWeb, selection == 0, caret >= 0, caret == utf16.count - 1, utf16[caret] == 10 else { return caret }
+    return caret + 1
+}

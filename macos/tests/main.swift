@@ -31,6 +31,13 @@ let mixed = "h\u{e9}llo \u{1F44B} w\u{f6}rld"  // héllo 👋 wörld
 check(scalarOffset(mixed, utf16: 8) == 7, "caret after emoji: utf16 8 -> scalar 7")
 check(scalarOffset(mixed, utf16: 999) == mixed.unicodeScalars.count, "caret clamped to end")
 check(scalarOffset(mixed, utf16: -1) == -1, "no caret stays -1")
+let twoLines = Array("first line.\n".utf16)
+check(webCaretOnEmptyLastLine(11, selection: 0, utf16: twoLines, isWeb: true) == 12, "web: empty last line reported before its newline")
+check(webCaretOnEmptyLastLine(11, selection: 0, utf16: twoLines, isWeb: false) == 11, "native fields are trusted")
+check(webCaretOnEmptyLastLine(5, selection: 0, utf16: twoLines, isWeb: true) == 5, "web: caret inside the text unchanged")
+check(webCaretOnEmptyLastLine(11, selection: 2, utf16: twoLines, isWeb: true) == 11, "web: a selection is left alone")
+let oneLine = Array("finished?".utf16)
+check(webCaretOnEmptyLastLine(9, selection: 0, utf16: oneLine, isWeb: true) == 9, "web: caret at the end of plain text unchanged")
 
 // --- LevelMeter ---
 check(abs((rmsDB(Data(count: 3200)) ?? 0) - (-90.309)) < 0.01, "silence is -90.3 dBFS")

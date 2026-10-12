@@ -50,9 +50,20 @@ enum AXCommand {
         var caret = -1
         if let r = copy(el, kAXSelectedTextRangeAttribute), CFGetTypeID(r) == AXValueGetTypeID() {
             var range = CFRange()
-            if AXValueGetValue(r as! AXValue, .cfRange, &range) { caret = scalarOffset(text, utf16: range.location) }
+            if AXValueGetValue(r as! AXValue, .cfRange, &range) {
+                let utf16 = webCaretOnEmptyLastLine(range.location, selection: range.length,
+                                                    utf16: Array(text.utf16), isWeb: isWebContent(el))
+                caret = scalarOffset(text, utf16: utf16)
+            }
         }
         return ["role": role, "text": text, "caret": caret]
+    }
+
+    /// A field inside a web page (Chrome, Electron): it exposes DOM attributes.
+    static func isWebContent(_ el: AXUIElement) -> Bool {
+        var names: CFArray?
+        guard AXUIElementCopyAttributeNames(el, &names) == .success, let list = names as? [String] else { return false }
+        return list.contains("AXDOMClassList") || list.contains("AXDOMIdentifier")
     }
 
     static func emit(_ object: [String: Any]) {
