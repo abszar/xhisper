@@ -33,4 +33,41 @@ enum AXCommand {
         print("\(clean(app?.bundleIdentifier))\t\(clean(app?.localizedName))\t\(clean(title))")
         return 0
     }
+
+    static func focusedElement() -> AXUIElement? {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 1.0)  // also the default for every element
+        if let el = element(copy(system, kAXFocusedUIElementAttribute)) { return el }
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        return element(copy(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedUIElementAttribute))
+    }
+
+    /// role, text and caret (in code points, like Python indices); nil once
+    /// the element is gone.
+    static func snapshot(_ el: AXUIElement) -> [String: Any]? {
+        guard let role = copy(el, kAXRoleAttribute) as? String else { return nil }
+        guard let text = copy(el, kAXValueAttribute) as? String else { return ["role": role] }
+        var caret = -1
+        if let r = copy(el, kAXSelectedTextRangeAttribute), CFGetTypeID(r) == AXValueGetTypeID() {
+            var range = CFRange()
+            if AXValueGetValue(r as! AXValue, .cfRange, &range) { caret = scalarOffset(text, utf16: range.location) }
+        }
+        return ["role": role, "text": text, "caret": caret]
+    }
+
+    static func emit(_ object: [String: Any]) {
+        let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
+        FileHandle.standardOutput.write(data + Data("\n".utf8))
+    }
+
+    /// `ax`: one JSON line. `ax --follow`: pin the element, one line per stdin line.
+    static func main(_ args: [String]) -> Int32 {
+        let el = focusedElement()
+        if args.contains("--follow") {
+            while readLine() != nil { emit(el.flatMap(snapshot) ?? ["gone": true]) }
+        } else {
+            emit(el.flatMap(snapshot) ?? [:])
+        }
+        return 0
+    }
 }

@@ -26,7 +26,7 @@ switch subcommand {
 case "notify": exit(Overlay.main(rest))
 case "history": exit(HistoryApp.main(rest))
 case "hotkey": exit(Hotkey.main(rest))
-case "ax": exit(notBuiltYet())
+case "ax": exit(AXCommand.main(rest))
 case "front": exit(AXCommand.front())
 case "paste": exit(Paste.main(rest))
 case "--version", "-V": print("Xhisper \(xhisperVersion)"); exit(0)

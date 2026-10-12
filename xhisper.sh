@@ -1196,9 +1196,14 @@ play_sound "$stop_sound"
 # accessibility must never hold up a dictation.
 CONTEXT_PID=""
 SCREEN_CONTEXT=""
-if [ "$screen_context" = "true" ] && [ "$auto_edit" = "true" ] && [ "$OS" != "Darwin" ] \
+if [ "$screen_context" = "true" ] && [ "$auto_edit" = "true" ] \
    && command -v "$XHISPER_LEARN" > /dev/null; then
-  timeout 2 "$XHISPER_LEARN" context < /dev/null > "$CONTEXT_FILE" 2>/dev/null &
+  if [ "$OS" = "Darwin" ]; then
+    # No `timeout` on macOS: xhisper-learn caps itself at 2 s there.
+    "$XHISPER_LEARN" context < /dev/null > "$CONTEXT_FILE" 2>/dev/null &
+  else
+    timeout 2 "$XHISPER_LEARN" context < /dev/null > "$CONTEXT_FILE" 2>/dev/null &
+  fi
   CONTEXT_PID=$!
 fi
 
@@ -1272,7 +1277,7 @@ paste "$TRANSCRIPTION" "$IS_TERMINAL"
 
 # Watch the field for a minute and learn the words the user corrects in it.
 # The text goes over stdin, never argv, so it stays out of `ps`.
-if [ "$learn_words" = "true" ] && [ "$OS" != "Darwin" ] && command -v "$XHISPER_LEARN" > /dev/null; then
+if [ "$learn_words" = "true" ] && command -v "$XHISPER_LEARN" > /dev/null; then
   printf '%s' "$TRANSCRIPTION" | "$XHISPER_LEARN" watch > /dev/null 2>&1 &
 fi
 
