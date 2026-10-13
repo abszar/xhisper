@@ -194,6 +194,7 @@ fi
 long_recording_threshold=1000
 transcription_prompt=""
 silence_threshold=-50
+min_speech_seconds=0.3
 auto_edit="true"
 tone_adaptation="true"
 language=""
@@ -251,6 +252,7 @@ if [ -f "$CONFIG_FILE" ]; then
       long-recording-threshold) long_recording_threshold="$value" ;;
       transcription-prompt) transcription_prompt="$value" ;;
       silence-threshold) silence_threshold="$value" ;;
+      min-speech-seconds) min_speech_seconds="$value" ;;
       auto-edit) auto_edit="$value" ;;
       tone-adaptation) tone_adaptation="$value" ;;
       language) language="$value" ;;
@@ -511,13 +513,51 @@ get_duration() {
   ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$recording" 2>/dev/null || echo "0"
 }
 
+# Seconds of sound that can be speech: 30 ms frames louder than both the
+# silence threshold and 12 dB over the recording's own noise floor (its 10th
+# percentile), counted only in runs of 90 ms or more. The click of the hotkey
+# or a keystroke is a loud peak but too short to count, and Whisper turns such
+# a recording into "Thank you." with full confidence (Groq's turbo model
+# reports no_speech_prob 0), so this has to be decided on the audio.
+voiced_seconds() {
+  ffmpeg -hide_banner -nostats -v error -i "$1" -ac 1 -ar 16000 -f s16le - 2>/dev/null \
+    | python3 -I -c '
+import array, math, sys
+data = sys.stdin.buffer.read()
+samples = array.array("h")
+samples.frombytes(data[:len(data) // 2 * 2])
+if sys.byteorder == "big":
+    samples.byteswap()
+size = 480
+levels = []
+for i in range(0, len(samples) - size + 1, size):
+    power = sum(s * s for s in samples[i:i + size]) / size
+    levels.append(10 * math.log10(power / 32768 ** 2) if power else -120.0)
+loud = max(float(sys.argv[1]), sorted(levels)[len(levels) // 10] + 12) if levels else 0
+voiced = run = 0
+for level in levels + [-120.0]:
+    if level > loud:
+        run += 1
+        continue
+    if run >= 3:
+        voiced += run
+    run = 0
+print("%.2f" % (voiced * size / 16000))' "$silence_threshold"
+}
+
 is_silent() {
   local recording="$1"
   local max_vol
   max_vol=$(ffmpeg -hide_banner -nostats -i "$recording" -af "volumedetect" -f null /dev/null 2>&1 \
     | awk '/max_volume/ { print $(NF-1); exit }')
   [ -z "$max_vol" ] && return 1
-  LC_ALL=C awk -v v="$max_vol" -v t="$silence_threshold" 'BEGIN { exit !(v < t) }'
+  LC_ALL=C awk -v v="$max_vol" -v t="$silence_threshold" 'BEGIN { exit !(v < t) }' && return 0
+  LC_ALL=C awk -v m="$min_speech_seconds" 'BEGIN { exit !(m > 0) }' || return 1
+  local voiced
+  voiced=$(voiced_seconds "$recording")
+  [ -z "$voiced" ] && return 1
+  log_line "Voiced: ${voiced}s (peak ${max_vol} dB)"
+  LC_ALL=C awk -v v="$voiced" -v m="$min_speech_seconds" 'BEGIN { exit !(v < m) }'
 }
 
 # Feed the API key to curl through stdin instead of argv, so it never shows up

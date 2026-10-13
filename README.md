@@ -44,6 +44,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 | History window (Copy, Edit) | ✅ | ✅ native window |
 | Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit; Terminal.app exposes its text (read check only); iTerm2: screen context ✅, learning watcher attaches (a correction there not yet tested). Chrome/Electron: not forced, same limit as Linux |
 | Smart spacing between dictations (`smart-spacing`) | ✅ AT-SPI (GTK field, Tilix, Chrome textarea: empty field, after ".", after a space and "("; a later fix is still learned); last-paste fallback ✅ for unreadable fields (same app within 2 min, not another app, not after 2 min). Chrome ✅ re-tested 2026-10-12 after the stale-document fix: claude.ai composer (one space after "finished?", none on an empty new paragraph or in an empty composer), Gmail body (same three), plain textarea (empty, after "?", new line, after "("); GTK Text Editor and Tilix unchanged ✅ | ✅ TextEdit (empty field, after ".", after a space and "("; a later fix is still learned), Chrome (address bar, claude.ai rich editor: one space after text, none on an empty new line); cmux ✅ via the last-paste fallback (its terminal exposes no text, so no learning there) |
+| Silent recordings discarded, even with a hotkey click in them (`min-speech-seconds`) | ✅ real microphone (TONOR, Alt → Ctrl toggle): 5.5 s of silence with the hotkey clicks discarded (Voiced 0.24 s), "yes" kept (0.51 s), a sentence kept (1.41 s); test files ✅ (silence, noise, one or two clicks discarded; speech 30 dB quieter kept) | ⏳ shared code (ffmpeg + python3), untested on the Mac |
 | Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ✅ iTerm2 (tap, hold, Escape not reaching Claude Code); Terminal.app ⏳ untested |
 
 Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.
@@ -373,6 +374,7 @@ cp default_dictionary.txt ~/.config/xhisper/dictionary.txt
 ### Linux
 
 **No sound detected**: Check that your microphone is working and PipeWire is running (`pw-record --channels=1 test.wav`).
+A recording with less than `min-speech-seconds` (0.3 s) of speech-like sound is also discarded as No sound, because Whisper turns a silent recording with just the hotkey click into "Thank you.". `xhisper --log` shows `Voiced: …s` for each recording; lower the value if very short words get dropped, or set it to 0 to turn the check off.
 
 **Permission denied on /dev/uinput**: Make sure you completed step 3 (udev rules) and that you're in the `input` group.
 

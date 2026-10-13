@@ -60,6 +60,9 @@ smart-spacing            : true
 # Silence Detection:
 # Recordings whose peak volume stays under this many dB are discarded.
 silence-threshold        : -50
+# ...and so are those with less than this many seconds of speech-like sound
+# (a hotkey click alone made Whisper write "Thank you."). 0 turns it off.
+min-speech-seconds       : 0.3
 
 # AI Auto-editing:
 # Removes filler words, stutters and false starts, applies spoken self-corrections
