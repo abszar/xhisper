@@ -1248,9 +1248,11 @@ KEY_RC=$?
 STOP_TIME=$(now_seconds)
 
 # Stop recording
+# No pause after this: once the recorder has exited its file is complete,
+# header included (checked on pw-record, 2026-10-14); a 0.2 s sleep here only
+# delayed every paste.
 kill $REC_PID 2>/dev/null
 wait $REC_PID 2>/dev/null
-sleep 0.2
 
 if [ "$KEY_RC" -eq 3 ]; then
   if [ "$OS" = "Darwin" ]; then
