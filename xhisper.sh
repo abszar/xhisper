@@ -60,6 +60,9 @@ HISTORYFLAG="$RUNTIME_DIR/xhisper.history"
 CONTEXT_FILE="$RUNTIME_DIR/screen-context.txt"
 BEFORE_FILE="$RUNTIME_DIR/caret-before.txt"
 LLM_REQUEST="$RUNTIME_DIR/llm-request.json"
+TRANSCRIPT_FILE="$RUNTIME_DIR/transcript.txt"
+WINDOW_FILE="$RUNTIME_DIR/active-window.txt"
+WINDOW_CLASS_FILE="$RUNTIME_DIR/active-window-class.txt"
 export XHISPER_STOPFILE="$STOPFILE"
 # Written by the overlay when its History button is clicked mid-recording:
 # the key loop treats it as a cancel and leaves the overlay to its transition.
@@ -508,8 +511,21 @@ hide_status() {
   fi
 }
 
+# Read from the WAV header (byte rate at offset 28) and the file size: ffprobe
+# cost 35-60 ms on every dictation for a number the header already holds.
+# ffprobe stays the fallback for a header this cannot read.
 get_duration() {
-  local recording="$1"
+  local recording="$1" rate size
+  rate=$(od -An -tu4 -j28 -N4 "$recording" 2>/dev/null | tr -d ' ')
+  if [ "$OS" = "Darwin" ]; then
+    size=$(stat -f%z "$recording" 2>/dev/null)
+  else
+    size=$(stat -c%s "$recording" 2>/dev/null)
+  fi
+  if [ "${rate:-0}" -gt 0 ] 2>/dev/null && [ -n "$size" ]; then
+    LC_ALL=C awk -v s="$size" -v r="$rate" 'BEGIN { printf "%.6f\n", (s > 44 ? s - 44 : 0) / r }'
+    return
+  fi
   ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$recording" 2>/dev/null || echo "0"
 }
 
@@ -1126,7 +1142,7 @@ cleanup() {
   # Terminal overlays (done/silent/error) are meant to stay on screen after we
   # exit, so only hide the ones that would otherwise linger forever.
   [ "$FINAL_OVERLAY" -eq 0 ] && hide_status
-  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$HISTORYFLAG" "$LLM_REQUEST" "$CONTEXT_FILE" "$BEFORE_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
+  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$HISTORYFLAG" "$LLM_REQUEST" "$CONTEXT_FILE" "$BEFORE_FILE" "$TRANSCRIPT_FILE" "$WINDOW_FILE" "$WINDOW_CLASS_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
   if [ -n "$SAVED_CLIPBOARD" ]; then
     printf '%s' "$SAVED_CLIPBOARD" | $CLIP_COPY
   fi
@@ -1279,9 +1295,17 @@ log_line "=== Recording ==="
 log_line "Duration: ${RECORDING_DURATION}s, Size: ${RECORDING_SIZE} bytes"
 log_line "Ended because: ${KEY_REASON:-unknown}"
 
+# Speed: the upload to Whisper starts now, beside the silence check (two ffmpeg
+# passes) and the front-window lookup, instead of after them. A silent clip just
+# throws its answer away. Same audio, same request: nothing about the result changes.
+transcribe "$RECORDING" > "$TRANSCRIPT_FILE" 2>/dev/null &
+TRANSCRIBE_PID=$!
+( get_active_window > "$WINDOW_FILE"; get_active_window_class > "$WINDOW_CLASS_FILE" ) 2>/dev/null &
+WINDOW_PID=$!
+
 # Check if recording is silent
 if is_silent "$RECORDING"; then
-  log_line "Result: [silent — skipped]"
+  log_line "Result: [silent — skipped, its transcription discarded]"
   # Longer than the other final pills: it carries the History button.
   show_status silent --timeout 3500
   FINAL_OVERLAY=1
@@ -1290,15 +1314,19 @@ if is_silent "$RECORDING"; then
 fi
 
 show_status transcribing
-TRANSCRIPTION=$(transcribe "$RECORDING")
+wait "$TRANSCRIBE_PID" 2>/dev/null
+TRANSCRIPTION=$(cat "$TRANSCRIPT_FILE" 2>/dev/null)
+rm -f "$TRANSCRIPT_FILE"
 
 if [ -z "$TRANSCRIPTION" ]; then
   fail "transcription failed — see 'xhisper --log' for the API response"
 fi
 
 # Detect active window (used for tone adaptation and paste method)
-ACTIVE_WINDOW=$(get_active_window)
-ACTIVE_CLASS=$(get_active_window_class)
+wait "$WINDOW_PID" 2>/dev/null
+ACTIVE_WINDOW=$(cat "$WINDOW_FILE" 2>/dev/null)
+ACTIVE_CLASS=$(cat "$WINDOW_CLASS_FILE" 2>/dev/null)
+rm -f "$WINDOW_FILE" "$WINDOW_CLASS_FILE"
 IS_TERMINAL=0
 is_terminal_window "$ACTIVE_CLASS" "$ACTIVE_WINDOW" && IS_TERMINAL=1
 log_line "=== Window ==="
