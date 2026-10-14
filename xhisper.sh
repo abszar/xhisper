@@ -1132,13 +1132,33 @@ PYEOF
 )
 }
 
+# A process and everything it started. Descendants are listed before any
+# signal is sent, so none of them can be re-parented out of reach.
+kill_tree() {
+  local pids="$1" all="" next child
+  while [ -n "$pids" ]; do
+    all="$all $pids"
+    next=""
+    for child in $pids; do
+      next="$next $(pgrep -P "$child" 2>/dev/null)"
+    done
+    pids=$(printf '%s' "$next" | xargs)
+  done
+  # shellcheck disable=SC2086
+  kill $all 2>/dev/null
+}
+
 # Cleanup
 CLEANED_UP=0
 FINAL_OVERLAY=0
+TRANSCRIBE_PID=""
 cleanup() {
   [ "$CLEANED_UP" -eq 1 ] && return
   CLEANED_UP=1
   pkill -f "$PROCESS_PATTERN" 2>/dev/null
+  # An upload still running is one nobody will read (silent clip, early
+  # failure): stop it rather than spend an API call on it.
+  [ -n "$TRANSCRIBE_PID" ] && kill_tree "$TRANSCRIBE_PID"
   # Terminal overlays (done/silent/error) are meant to stay on screen after we
   # exit, so only hide the ones that would otherwise linger forever.
   [ "$FINAL_OVERLAY" -eq 0 ] && hide_status
@@ -1225,6 +1245,7 @@ fi
 # Wait for key release, for a second press, or for max-recording-seconds
 wait_for_key_release
 KEY_RC=$?
+STOP_TIME=$(now_seconds)
 
 # Stop recording
 kill $REC_PID 2>/dev/null
@@ -1296,8 +1317,8 @@ log_line "Duration: ${RECORDING_DURATION}s, Size: ${RECORDING_SIZE} bytes"
 log_line "Ended because: ${KEY_REASON:-unknown}"
 
 # Speed: the upload to Whisper starts now, beside the silence check (two ffmpeg
-# passes) and the front-window lookup, instead of after them. A silent clip just
-# throws its answer away. Same audio, same request: nothing about the result changes.
+# passes) and the front-window lookup, instead of after them. A silent clip stops
+# it (cleanup). Same audio, same request: nothing about the result changes.
 transcribe "$RECORDING" > "$TRANSCRIPT_FILE" 2>/dev/null &
 TRANSCRIBE_PID=$!
 ( get_active_window > "$WINDOW_FILE"; get_active_window_class > "$WINDOW_CLASS_FILE" ) 2>/dev/null &
@@ -1305,7 +1326,7 @@ WINDOW_PID=$!
 
 # Check if recording is silent
 if is_silent "$RECORDING"; then
-  log_line "Result: [silent — skipped, its transcription discarded]"
+  log_line "Result: [silent — skipped, upload stopped]"
   # Longer than the other final pills: it carries the History button.
   show_status silent --timeout 3500
   FINAL_OVERLAY=1
@@ -1315,6 +1336,7 @@ fi
 
 show_status transcribing
 wait "$TRANSCRIBE_PID" 2>/dev/null
+TRANSCRIBE_PID=""  # done: its pid may be reused, never signal it again
 TRANSCRIPTION=$(cat "$TRANSCRIPT_FILE" 2>/dev/null)
 rm -f "$TRANSCRIPT_FILE"
 
@@ -1371,6 +1393,9 @@ if [ -n "$BEFORE_PID" ]; then
   rm -f "$BEFORE_FILE"
 fi
 paste "$PASTE_TEXT" "$IS_TERMINAL"
+# The wait the user actually feels: from releasing/stopping to the paste.
+log_line "=== Total ==="
+log_line "Stop to paste: $(elapsed_since "$STOP_TIME")s"
 
 # Watch the field for a minute and learn the words the user corrects in it.
 # The text goes over stdin, never argv, so it stays out of `ps`.
