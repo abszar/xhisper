@@ -310,6 +310,22 @@ instance_alive() {
   return 0
 }
 
+# A process and everything it started. Descendants are listed before any
+# signal is sent, so none of them can be re-parented out of reach.
+kill_tree() {
+  local pids="$1" all="" next child
+  while [ -n "$pids" ]; do
+    all="$all $pids"
+    next=""
+    for child in $pids; do
+      next="$next $(pgrep -P "$child" 2>/dev/null)"
+    done
+    pids=$(printf '%s' "$next" | xargs)
+  done
+  # shellcheck disable=SC2086
+  kill $all 2>/dev/null
+}
+
 # Past every timeout the pipeline can hit, a live instance is wedged, not busy.
 stuck_after=$(( max_recording_seconds + stt_timeout + llm_timeout + 60 ))
 # Same bound for the overlay: past it, a pill on screen is a leak, not a status.
@@ -325,7 +341,10 @@ if [ -f "$PIDFILE" ]; then
       [ "$TOGGLE_MODE" -eq 1 ] && touch "$STOPFILE"
       exit 0
     fi
-    kill "$OLD_PID" 2>/dev/null
+    # With its children: a wedged instance is usually blocked in one of them
+    # (2026-10-14: an `xclip -o` the clipboard owner never answered), and bash
+    # only acts on TERM once that child returns.
+    kill_tree "$OLD_PID"
   fi
   rm -f "$PIDFILE"
 fi
@@ -1132,26 +1151,11 @@ PYEOF
 )
 }
 
-# A process and everything it started. Descendants are listed before any
-# signal is sent, so none of them can be re-parented out of reach.
-kill_tree() {
-  local pids="$1" all="" next child
-  while [ -n "$pids" ]; do
-    all="$all $pids"
-    next=""
-    for child in $pids; do
-      next="$next $(pgrep -P "$child" 2>/dev/null)"
-    done
-    pids=$(printf '%s' "$next" | xargs)
-  done
-  # shellcheck disable=SC2086
-  kill $all 2>/dev/null
-}
-
 # Cleanup
 CLEANED_UP=0
 FINAL_OVERLAY=0
 TRANSCRIBE_PID=""
+WINDOW_PID=""
 cleanup() {
   [ "$CLEANED_UP" -eq 1 ] && return
   CLEANED_UP=1
@@ -1159,6 +1163,7 @@ cleanup() {
   # An upload still running is one nobody will read (silent clip, early
   # failure): stop it rather than spend an API call on it.
   [ -n "$TRANSCRIBE_PID" ] && kill_tree "$TRANSCRIBE_PID"
+  [ -n "$WINDOW_PID" ] && kill_tree "$WINDOW_PID"
   # Terminal overlays (done/silent/error) are meant to stay on screen after we
   # exit, so only hide the ones that would otherwise linger forever.
   [ "$FINAL_OVERLAY" -eq 0 ] && hide_status
@@ -1167,7 +1172,12 @@ cleanup() {
     printf '%s' "$SAVED_CLIPBOARD" | $CLIP_COPY
   fi
 }
-trap cleanup EXIT INT TERM
+# INT/TERM must end the run, not just clean up: with `trap cleanup ... TERM`
+# the script went on after cleanup() with its recording deleted (2026-10-14).
+# exit runs the EXIT trap, so cleanup() still runs once.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Main — Push-to-talk flow
 
@@ -1304,8 +1314,17 @@ if [ "$smart_spacing" = "true" ] && command -v "$XHISPER_LEARN" > /dev/null; the
   BEFORE_PID=$!
 fi
 
-# Save clipboard for paste phase
-SAVED_CLIPBOARD=$($CLIP_PASTE 2>/dev/null)
+# Save clipboard for paste phase. On X11 the read is answered by the app that
+# owns the clipboard, and xclip waits forever if it never does: on 2026-10-14
+# Chrome missed one request and the dictation hung here, holding the lock, so
+# every later hotkey press was ignored. Capped at 1 s; past it the old
+# clipboard is simply not restored.
+if [ "$OS" = "Darwin" ]; then
+  SAVED_CLIPBOARD=$($CLIP_PASTE 2>/dev/null)
+else
+  SAVED_CLIPBOARD=$(timeout 1 $CLIP_PASTE 2>/dev/null)
+  [ $? -eq 124 ] && log_line "Clipboard: its owner did not answer within 1 s; it will not be restored"
+fi
 
 # Log recording info
 RECORDING_DURATION=$(get_duration "$RECORDING")
@@ -1348,6 +1367,7 @@ fi
 
 # Detect active window (used for tone adaptation and paste method)
 wait "$WINDOW_PID" 2>/dev/null
+WINDOW_PID=""
 ACTIVE_WINDOW=$(cat "$WINDOW_FILE" 2>/dev/null)
 ACTIVE_CLASS=$(cat "$WINDOW_CLASS_FILE" 2>/dev/null)
 rm -f "$WINDOW_FILE" "$WINDOW_CLASS_FILE"

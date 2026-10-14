@@ -141,7 +141,7 @@ Tone (`get_tone_for_window`) is appended as a CONTEXT line that explicitly scope
 
 ### Conventions observed in this repo
 
-- Shell: `bash` with `[ ]` tests, double-quoted expansions, `set -e` is **not** used (errors are handled via explicit checks and `trap cleanup EXIT INT TERM`).
+- Shell: `bash` with `[ ]` tests, double-quoted expansions, `set -e` is **not** used (errors are handled via explicit checks and `trap cleanup EXIT`, with INT/TERM trapped as plain `exit` so the run really ends; `trap cleanup INT TERM` alone let the script go on after cleanup with its recording deleted). Anything that waits on another program gets a cap: the clipboard save is `timeout 1 xclip -o` because an X clipboard owner that never answers (Chrome, 2026-10-14) hung a dictation while it held the lock, and every later press was ignored.
 - The platform split is always `if [ "$OS" = "Darwin" ]` (shell) or `sys.platform == "darwin"` (Python); do not introduce a third code path without a clear reason. Swift lives only in `macos/`.
 - Config keys in `xhisperrc` use kebab-case with ` : ` separator; the parser strips whitespace, surrounding quotes and inline ` # comments` (quote the value to keep a literal `#`). Unknown keys are ignored, so removing a key does not break existing user configs. Shell variables use snake_case.
 - The `press_wrap_key` mechanism (`--leftalt` etc.) exists for keyboard-layout workarounds — it taps the given modifier before and after paste to force some IMEs/layouts to commit layer state. It's a no-op on macOS.
