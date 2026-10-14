@@ -61,6 +61,17 @@ STATE_LABELS = {
 # States whose pill carries a clickable "History" chip. On "recording" a click
 # also cancels the dictation (via XHISPER_HISTORYFLAG, polled by xhisper.sh).
 HISTORY_STATES = ("recording", "silent")
+# States that update the pill already on screen instead of replacing it: one
+# pill per dictation (user, 2026-10-14: "too many pop-ups"; a pill that shrank
+# into a second look was not liked either). The recording pill keeps its size,
+# place and History chip; only its text turns to "Transcribing" and its bars
+# settle into the slow wave, through editing as well. done just lets it go, no
+# Done pill. silent/error/cancelled/learned still replace it.
+IN_PLACE_STATES = ("transcribing", "editing", "done")
+# Pills that a later stage of their own dictation may update.
+UPDATABLE_STATES = ("recording", "transcribing", "editing")
+WORKING_LABEL = STATE_LABELS["transcribing"]
+BLEND_SECONDS = 0.35  # live level bars ease into the slow wave
 CHIP_LABEL = "History"
 CHIP_COLOR = (1.0, 1.0, 1.0, 0.10)
 CHIP_HOVER_COLOR = (1.0, 1.0, 1.0, 0.22)
@@ -80,6 +91,7 @@ try:
 except OSError:
     RUNTIME_DIR = "/tmp"
 PID_FILE = os.path.join(RUNTIME_DIR, "xhisper-notify.pid")
+NEXT_STATE_FILE = os.path.join(RUNTIME_DIR, "xhisper-notify.next")
 HISTORY_FILE = os.environ.get("XHISPER_HISTORY_FILE") or os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
     "xhisper", "history.jsonl")
@@ -127,6 +139,7 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         self.pointer_inside = False
         self.launch_start = None  # set when the History chip is clicked
         self.live = False  # True once the recording file yields audio
+        self.blend_start = None  # set when recording turns into transcribing
         if state == "recording":
             self.wav_path = os.environ.get("XHISPER_RECORDING") or os.path.join(RUNTIME_DIR, "xhisper.wav")
             self.levels = [0.0] * NUM_BARS
@@ -143,33 +156,14 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         self.set_decorated(False)
 
         # Dimensions
-        wave_w = NUM_BARS * BAR_WIDTH + (NUM_BARS - 1) * BAR_GAP
         # The learned pill is read, not glanced at: bigger text and button.
-        big = state == "learned"
-        self.pill_height = 60 if big else 48
-        self.font_size = 17 if big else 13
-        self.chip_font_size = 14 if big else 12
+        self.big = state == "learned"
+        self.pill_height = 60 if self.big else 48
+        self.font_size = 17 if self.big else 13
+        self.chip_font_size = 14 if self.big else 12
         self.max_bar_height = self.pill_height - 14
-        if big:
-            # Measure: the 8 px-per-character estimate is too tight at this size.
-            probe = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
-            probe.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            probe.set_font_size(self.font_size)
-            text_w = int(probe.text_extents(self.label).x_advance) + 24
-        else:
-            text_w = (len(self.label) + 3) * 8 + 8
         self.wave_x = 20
-        if self.show_waves:
-            self.text_x = self.wave_x + NUM_BARS * (BAR_WIDTH + BAR_GAP) + 8
-            self.pill_width = 24 + wave_w + 16 + text_w + 20
-        else:
-            self.text_x = 26 if big else 24
-            self.pill_width = self.text_x + text_w + 12
-        if self.show_chip:
-            self.chip_w, self.chip_h = (92, 36) if big else (72, 28)
-            self.chip_x = self.pill_width - 8
-            self.chip_y = (self.pill_height - self.chip_h) / 2
-            self.pill_width += self.chip_w + 2
+        self.measure()
         self.set_size_request(self.pill_width, self.pill_height + 4)
 
         if self.use_layer_shell:
@@ -215,6 +209,56 @@ class WavePill(Gtk.Window if HAS_GTK else object):
             GLib.timeout_add_seconds(max_life, lambda: Gtk.main_quit() or False)
 
         self.show_all()
+
+    def measure(self):
+        """Width of the pill for the current label and chip."""
+        wave_w = NUM_BARS * BAR_WIDTH + (NUM_BARS - 1) * BAR_GAP
+        if self.big:
+            # Measure: the 8 px-per-character estimate is too tight at this size.
+            probe = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+            probe.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            probe.set_font_size(self.font_size)
+            text_w = int(probe.text_extents(self.label).x_advance) + 24
+        else:
+            chars = len(self.label)
+            if self.state in UPDATABLE_STATES:
+                # Room for "Transcribing" from the start: the pill must not
+                # change size when its text does.
+                chars = max(chars, len(WORKING_LABEL))
+            text_w = (chars + 3) * 8 + 8
+        if self.show_waves:
+            self.text_x = self.wave_x + NUM_BARS * (BAR_WIDTH + BAR_GAP) + 8
+            self.pill_width = 24 + wave_w + 16 + text_w + 20
+        else:
+            self.text_x = 26 if self.big else 24
+            self.pill_width = self.text_x + text_w + 12
+        if self.show_chip:
+            self.chip_w, self.chip_h = (92, 36) if self.big else (72, 28)
+            self.chip_x = self.pill_width - 8
+            self.chip_y = (self.pill_height - self.chip_h) / 2
+            self.pill_width += self.chip_w + 2
+
+    def update_state(self, next_state):
+        """A later stage of the same dictation, applied to this pill where it
+        stands: no new window, no slide-in. See IN_PLACE_STATES."""
+        if self.launch_start is not None or self.closing:
+            return
+        # A pill of another kind (a Learned notice, a final pill) is not ours to
+        # turn into a dictation stage.
+        if self.state not in UPDATABLE_STATES:
+            return
+        if next_state == "done":
+            self.start_close()
+            return
+        if self.state != "recording":
+            return
+        # Same window, same size, same chip: only the text and the bars change.
+        # The live bars are frozen where they stand and eased into the wave.
+        t = time.time() - self.start_time
+        self.blend_from = [self.bar_height(i, t) for i in range(NUM_BARS)]
+        self.blend_start = time.time()
+        self.state = "transcribing"
+        self.label = WORKING_LABEL
 
     def start_close(self):
         if self.launch_start is not None:
@@ -390,6 +434,11 @@ class WavePill(Gtk.Window if HAS_GTK else object):
             f = 0.7 + 0.3 * math.sin(t * 5 + i * 0.45)
         elif self.state in ("transcribing", "editing"):
             f = 0.75 + 0.15 * math.sin(t * 2.5 + i * 0.35)
+            if self.blend_start is not None:
+                p = (time.time() - self.blend_start) / BLEND_SECONDS
+                if p < 1.0:
+                    e = self.ease_out_cubic(p)
+                    return max(self.blend_from[i] * (1 - e) + base * f * e, BAR_WIDTH)
         elif self.state in ("done", "learned"):
             f = max(0.15, 1.0 - t * 1.5)
         elif self.state in ("silent", "error", "cancelled"):
@@ -480,6 +529,35 @@ def write_pid_file():
         pass
 
 
+def process_argv(pid):
+    try:
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            return f.read().decode('utf-8', 'replace').split('\0')
+    except OSError:
+        return []
+
+
+def hand_over(state):
+    """Pass an in-place state to the overlay already on screen. True if it was
+    delivered. Only an older overlay qualifies: a slow `done` from the last
+    dictation must not close the pill of the next one."""
+    pid = read_pid_file()
+    me = os.getpid()
+    if (pid is None or pid == me or not is_alive(pid)
+            or not is_overlay_argv(process_argv(pid))
+            or not is_older(pid, start_time(me), me)):
+        return False
+    try:
+        tmp = NEXT_STATE_FILE + ".%d" % me
+        with open(tmp, "w") as f:
+            f.write(state)
+        os.replace(tmp, NEXT_STATE_FILE)
+        os.kill(pid, signal.SIGUSR1)
+    except OSError:
+        return False
+    return True
+
+
 def is_alive(pid):
     try:
         os.kill(pid, 0)
@@ -565,10 +643,9 @@ def running_overlays():
         try:
             if os.stat('/proc/%d' % pid).st_uid != uid:
                 continue
-            with open('/proc/%d/cmdline' % pid, 'rb') as f:
-                argv = f.read().decode('utf-8', 'replace').split('\0')
         except OSError:
             continue
+        argv = process_argv(pid)
         if is_overlay_argv(argv):
             if is_older(pid, my_start, me):
                 found.append(pid)
@@ -637,6 +714,17 @@ def main():
         if idx + 1 < len(sys.argv):
             unlearn = [w for w in sys.argv[idx + 1].split(",") if w]
 
+    # A later stage of a dictation goes to the pill already on screen. It is
+    # handed over in a file, then SIGUSR1; the pill installs its handler before
+    # it registers its pid, so any pid found there will not die of the signal.
+    if state in IN_PLACE_STATES:
+        if hand_over(state):
+            return
+        # Nothing on screen to update: a lone "done" shows nothing.
+        if state == "done":
+            kill_existing()
+            return
+
     kill_existing()
     if state == "hide":
         return
@@ -653,11 +741,33 @@ def main():
 
     signal.signal(signal.SIGTERM, lambda *_: GLib.idle_add(Gtk.main_quit))
 
+    # Before write_pid_file: from then on a later stage may send SIGUSR1, whose
+    # default action would kill us. GLib catches it now and dispatches it once
+    # the main loop runs; a state that arrives before the pill exists waits.
+    pill = None
+    pending = []
+
+    def on_next_state():
+        try:
+            with open(NEXT_STATE_FILE) as f:
+                next_state = f.read().strip()
+        except OSError:
+            return GLib.SOURCE_CONTINUE
+        if pill is None:
+            pending[:] = [next_state]
+        else:
+            pill.update_state(next_state)
+        return GLib.SOURCE_CONTINUE
+
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, on_next_state)
+
     # Register before building the window: GTK setup costs about half a second,
     # and until the PID file names us the next overlay cannot find us to kill.
     write_pid_file()
 
-    WavePill(state=state, timeout_ms=timeout_ms, label=label, unlearn=unlearn)
+    pill = WavePill(state=state, timeout_ms=timeout_ms, label=label, unlearn=unlearn)
+    if pending:
+        pill.update_state(pending.pop())
     Gtk.main()
 
     release_pid_file()
