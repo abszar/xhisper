@@ -419,8 +419,9 @@ paste() {
   local text="$1"
   local is_terminal="$2"
   press_wrap_key
+  # No pause before the keystroke: xclip/wl-copy/pbcopy own the clipboard by
+  # the time they return (xclip: 100 of 100 reads right after, 2026-10-14).
   printf '%s' "$text" | $CLIP_COPY
-  sleep 0.05
   if [ "$OS" = "Darwin" ]; then
     # Plain Cmd+V everywhere: macOS terminals paste the clipboard with it, and
     # Cmd+Shift+V is "Paste Selection" in Terminal.app.
@@ -437,7 +438,6 @@ paste() {
       "$XHISPERTOOL" paste
     fi
   fi
-  sleep 0.05
   if command -v copyq &> /dev/null; then
     copyq remove 0 &>/dev/null &
   fi
@@ -1409,8 +1409,10 @@ fi
 show_status done --timeout 1500
 FINAL_OVERLAY=1
 
-# Restore original clipboard
-sleep 0.1
+# Restore original clipboard. The app reads the clipboard after it gets the
+# keystroke, so give it time first: 0.15 s (it was 0.1 s plus a 0.05 s pause at
+# the end of paste(), which delayed the log's paste time for nothing).
+sleep 0.15
 if [ -n "$SAVED_CLIPBOARD" ]; then
   printf '%s' "$SAVED_CLIPBOARD" | $CLIP_COPY
 fi
