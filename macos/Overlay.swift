@@ -25,9 +25,16 @@ private let stateLabels = ["recording": "Recording", "transcribing": "Transcribi
 private let historyStates: Set<String> = ["recording", "silent"]
 /// States that update the pill already on screen instead of replacing it: one pill
 /// per dictation, no new slide-in for every stage (user, 2026-10-14: "too many
-/// pop-ups"). transcribing/editing both become the quiet "working" look; done just
-/// lets the pill go — no Done pill, no checkmark.
+/// pop-ups"; a pill that shrank into a second look was not liked either). The
+/// recording pill keeps its size, place and History chip; only its text turns to
+/// "Transcribing" and its bars settle into the slow wave, through editing as
+/// well. done just lets it go — no Done pill. silent/error/cancelled/learned
+/// still replace it.
 let inPlaceStates: Set<String> = ["transcribing", "editing", "done"]
+/// Pills that a later stage of their own dictation may update.
+private let updatableStates: Set<String> = ["recording", "transcribing", "editing"]
+private let workingLabel = stateLabels["transcribing"]!
+private let blendSeconds = 0.35  // live level bars ease into the slow wave
 private let env = ProcessInfo.processInfo.environment
 
 private func hasHistory() -> Bool {
@@ -105,6 +112,8 @@ final class Pill {
     var closing = false, chipHover = false, pointerInside = false
     var launchStart: Date?
     var live = false  // true once the recording yields audio
+    var blendStart: Date?  // set when recording turns into transcribing
+    var blendFrom: [CGFloat] = []
     var meter = LevelMeter(bars: numBars)
     var lastPush = Date.distantPast
     let wavPath: String
@@ -167,9 +176,12 @@ final class Pill {
     /// Width of the pill for the current label and chip.
     func measure() {
         let waveW = CGFloat(numBars) * barWidth + CGFloat(numBars - 1) * barGap
+        // Room for "Transcribing" from the start: the pill must not change size
+        // when its text does.
+        let chars = updatableStates.contains(state) ? max(label.count, workingLabel.count) : label.count
         let textW: CGFloat = big
             ? (label as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: fontSize)]).width + 24
-            : CGFloat((label.count + 3) * 8 + 8)
+            : CGFloat((chars + 3) * 8 + 8)
         if showWaves {
             textX = waveX + CGFloat(numBars) * (barWidth + barGap) + 8
             pillWidth = 24 + waveW + 16 + textW + 20
@@ -189,21 +201,18 @@ final class Pill {
     /// no new window, no slide-in. See `inPlaceStates`.
     func update(to next: String) {
         if launchStart != nil || closing { return }
+        // A pill of another kind (a Learned notice, a final pill) is not ours to
+        // turn into a dictation stage.
+        guard updatableStates.contains(state) else { return }
         if next == "done" { startClose(); return }
-        guard state != "working" else { return }
-        state = "working"
-        label = ""
-        showChip = false
-        setChipHover(false)
-        pointerInside = false
-        panel.ignoresMouseEvents = true
-        // Narrower now (no "Recording", no History chip): shrink around the same centre.
-        let oldWidth = pillWidth
-        measure()
-        target.x = (target.x + (oldWidth - pillWidth) * pillScale / 2).rounded()
-        let size = NSSize(width: (pillWidth + 2) * pillScale, height: (pillHeight + 4) * pillScale)
-        panel.setContentSize(size)
-        view.frame = NSRect(origin: .zero, size: size)
+        guard state == "recording" else { return }
+        // Same window, same size, same chip: only the text and the bars change.
+        // The live bars are frozen where they stand and eased into the wave.
+        let t = CGFloat(Date().timeIntervalSince(startTime))
+        blendFrom = (0..<numBars).map { barHeight($0, t) }
+        blendStart = Date()
+        state = "transcribing"
+        label = workingLabel
     }
 
     func startClose() {
@@ -302,7 +311,15 @@ final class Pill {
         let f: CGFloat
         switch state {
         case "recording": f = 0.7 + 0.3 * sin(t * 5 + CGFloat(i) * 0.45)
-        case "transcribing", "editing", "working": f = 0.75 + 0.15 * sin(t * 2.5 + CGFloat(i) * 0.35)
+        case "transcribing", "editing":
+            f = 0.75 + 0.15 * sin(t * 2.5 + CGFloat(i) * 0.35)
+            if let blend = blendStart {
+                let p = CGFloat(Date().timeIntervalSince(blend) / blendSeconds)
+                if p < 1 {
+                    let e = easeOutCubic(p)
+                    return max(blendFrom[i] * (1 - e) + base * f * e, barWidth)
+                }
+            }
         case "done", "learned": f = max(0.15, 1.0 - t * 1.5)
         case "silent", "error", "cancelled": f = 0.2 + 0.05 * sin(t * 1.5 + CGFloat(i) * 0.3)
         default: f = 0.5
@@ -345,7 +362,7 @@ final class Pill {
             }
         }
 
-        let dots = ["recording", "transcribing", "editing", "working"].contains(state) ? String(repeating: ".", count: Int(t * 2) % 4) : ""
+        let dots = updatableStates.contains(state) ? String(repeating: ".", count: Int(t * 2) % 4) : ""
         text(label + dots, x: textX, centreY: cy, size: fontSize, alpha: textColor.a * a,
              color: (textColor.r, textColor.g, textColor.b))
 
@@ -384,9 +401,12 @@ enum Overlay {
         // A later stage of a dictation goes to the pill already on screen (see
         // `inPlaceStates`). It is handed over in a file, then SIGUSR1; the pill
         // installs its handler before it registers its pid, so any pid found here
-        // is one that will not die of the signal.
+        // is one that will not die of the signal. Only an older pill qualifies: a
+        // slow `done` from the last dictation must not close the next one's pill.
         if inPlaceStates.contains(state) {
-            if let pid = readPid(pidFile), pid != getpid(), isAlive(pid), isOverlay(processArgs(pid)) {
+            let me = getpid()
+            if let pid = readPid(pidFile), pid != me, isAlive(pid), isOverlay(processArgs(pid)),
+               isOlder(pid, startTime(me), me) {
                 try? state.write(toFile: nextStateFile, atomically: true, encoding: .utf8)
                 kill(pid, SIGUSR1)
                 return 0
