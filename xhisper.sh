@@ -410,6 +410,37 @@ press_wrap_key() {
   fi
 }
 
+start_daemon() {
+  "$XHISPERTOOLD" < /dev/null >> "$RUNTIME_DIR/xhispertoold.log" 2>&1 &
+}
+
+# X11: is the daemon's uinput keyboard attached to the core keyboard? After a
+# suspend Xorg can leave it floating and disabled (2026-10-16: logind sent no
+# resume for its fd), and then every paste keystroke goes nowhere while the log
+# still shows a normal paste. Unknown (no xinput, X not answering) counts as
+# attached, so a broken check never restarts a working daemon.
+paste_device_attached() {
+  command -v xinput > /dev/null || return 0
+  local devices
+  devices=$(timeout 1 xinput list --short 2>/dev/null) || return 0
+  printf '%s\n' "$devices" | grep -qE '↳ xhisper[[:space:]]+id=[0-9]+[[:space:]]+\[slave +keyboard'
+}
+
+# A fresh daemon creates a fresh device, which X attaches and enables. Runs in
+# the background during the recording, so it never delays the paste; the old
+# daemon must be gone first, or the new one cannot bind its socket.
+repair_paste_device() {
+  paste_device_attached && return 0
+  pkill -x xhispertoold
+  local waited=0
+  while pgrep -x xhispertoold > /dev/null && [ "$waited" -lt 20 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  start_daemon
+  log_line "Paste keyboard: xhisper device was detached in X (after a suspend?); restarted xhispertoold"
+}
+
 lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
@@ -1248,8 +1279,12 @@ REC_PID=$!
 # back the key-release snapshot.
 # Its stdio is fully redirected: as a long-lived child it would otherwise hold
 # this script's stdout open for as long as it runs.
-if [ "$OS" != "Darwin" ] && ! pgrep -x xhispertoold > /dev/null; then
-  "$XHISPERTOOLD" < /dev/null >> "$RUNTIME_DIR/xhispertoold.log" 2>&1 &
+if [ "$OS" != "Darwin" ]; then
+  if ! pgrep -x xhispertoold > /dev/null; then
+    start_daemon
+  elif [ "$PREFERRED" = "x11" ]; then
+    repair_paste_device > /dev/null 2>&1 &
+  fi
 fi
 
 # Wait for key release, for a second press, or for max-recording-seconds
