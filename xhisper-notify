@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""xhisper-notify: Animated wave pill overlay for xhisper status."""
+"""xhisper-notify: Animated wave pill overlay for xhisper status.
+
+Look and motion follow design B1 / B2, the same numbers as the macOS pill
+(macos/PillLayout.swift, in points = logical pixels here).
+"""
 
 import math
 import sys
@@ -15,7 +19,8 @@ HAS_GTK = True
 try:
     import gi
     gi.require_version('Gtk', '3.0')
-    from gi.repository import Gtk, Gdk, GLib
+    gi.require_version('PangoCairo', '1.0')
+    from gi.repository import Gtk, Gdk, GLib, Pango, PangoCairo
     import cairo
 except (ImportError, ValueError):
     HAS_GTK = False
@@ -31,21 +36,46 @@ if IS_WAYLAND and HAS_GTK:
     except (ValueError, ImportError):
         pass
 
-# Wave bar layout — heights (0–1) matching an audio waveform shape
+# Geometry (design B1 / B2): every dictation state is 310 x 38, so the pill
+# never resizes; the learned notice hugs its text.
+WIDTH = 310
+HEIGHT = 38
+PAD_LEFT = 16
+PAD_RIGHT = 7         # = chip inset: chip radius 12 = 19 - 7, concentric
 NUM_BARS = 17
-BAR_WIDTH = 5
-BAR_GAP = 4
-BAR_RADIUS = 2.5
-BASE_HEIGHTS = [
-    0.30, 0.85, 0.30, 0.90, 0.55, 0.80, 0.95, 0.35,
-    0.60, 0.95, 0.80, 0.25, 0.85, 0.90, 0.55, 0.30, 0.50,
-]
+BAR_WIDTH = 4
+BAR_GAP = 3
+BAR_RADIUS = 2
+MIN_BAR = 4
+MAX_BAR = 24
+LABEL_GAP = 12        # bars to label
+LABEL_SLOT = 88       # fixed slot: no text ever moves the chip
+DOT_WIDTH = 4
+CHIP_HEIGHT = 24
+CHIP_PAD = 10
+HIT_LEAD = 6          # the chip's hit area starts this far left of it, full height
+LEARNED_PAD_LEFT = 14
+LEARNED_GAP = 8       # check to text
+LEARNED_CHIP_GAP = 14
+LEARNED_MIN_WIDTH = 200
+CHECK_SIZE = 12
+SHADOW_MARGIN = 30    # room around the pill for its two shadows
+BOTTOM_GAP = 55       # above the bottom of the work area (dock, panel)
+BAR_BLOCK = NUM_BARS * BAR_WIDTH + (NUM_BARS - 1) * BAR_GAP  # 116
+LABEL_X = PAD_LEFT + BAR_BLOCK + LABEL_GAP
 
-# Colors
-BG_COLOR = (0.10, 0.10, 0.10, 0.93)
-BAR_COLOR = (0.93, 0.91, 0.85)
-ERROR_BAR_COLOR = (0.91, 0.45, 0.40)
-TEXT_COLOR = (0.80, 0.78, 0.73, 0.9)
+
+def rgb(r, g, b):
+    return (r / 255, g / 255, b / 255)
+
+
+SURFACE = rgb(26, 26, 26) + (0.93,)
+EDGE = (1, 1, 1, 0.08)
+INK = rgb(237, 232, 217)          # bars, chip label, learned word
+LABEL_INK = rgb(204, 199, 186)    # label, at 0.9 (Cancelled 0.62)
+CORAL = rgb(232, 115, 102)        # Failed bars
+SUCCESS = rgb(150, 200, 140)
+CHIP_FILL = {"rest": 0.12, "hover": 0.22, "pressed": 0.30}
 
 STATE_LABELS = {
     "recording": "Recording",
@@ -58,24 +88,34 @@ STATE_LABELS = {
     "learned": "Learned",  # usually overridden with --label "Learned: WORD"
 }
 
-# States whose pill carries a clickable "History" chip. On "recording" a click
-# also cancels the dictation (via XHISPER_HISTORYFLAG, polled by xhisper.sh).
-HISTORY_STATES = ("recording", "silent")
+# Fresh pills that carry the History chip (one updated in place keeps the chip
+# it had while recording). On "recording" a click also cancels the dictation
+# (via XHISPER_HISTORYFLAG, polled by xhisper.sh).
+HISTORY_STATES = ("recording", "silent", "error", "cancelled")
 # States that update the pill already on screen instead of replacing it: one
 # pill per dictation (user, 2026-10-14: "too many pop-ups"; a pill that shrank
 # into a second look was not liked either). The recording pill keeps its size,
-# place and History chip; only its text turns to "Transcribing" and its bars
-# settle into the slow wave, through editing as well. done just lets it go, no
-# Done pill. silent/error/cancelled/learned still replace it.
-IN_PLACE_STATES = ("transcribing", "editing", "done")
-# Pills that a later stage of their own dictation may update.
+# place and History chip; its text and bars change. done just lets it go, no
+# Done pill. learned still replaces it, and silent/error/cancelled do when no
+# dictation pill is there to take them (the pill answers in ACK_FILE).
+IN_PLACE_STATES = ("transcribing", "editing", "done", "silent", "error", "cancelled")
+ACKED_STATES = ("silent", "error", "cancelled")
+# Pills that a later stage of their own dictation may update, and into what.
 UPDATABLE_STATES = ("recording", "transcribing", "editing")
-WORKING_LABEL = STATE_LABELS["transcribing"]
-BLEND_SECONDS = 0.35  # live level bars ease into the slow wave
-CHIP_LABEL = "History"
-CHIP_COLOR = (1.0, 1.0, 1.0, 0.10)
-CHIP_HOVER_COLOR = (1.0, 1.0, 1.0, 0.22)
-LAUNCH_SECONDS = 0.28  # pill-to-window transition
+FOLLOW_STATES = ("transcribing", "editing", "done", "silent", "error", "cancelled")
+WAVE_STATES = ("transcribing", "editing")
+
+# Motion (design B2), seconds and pixels.
+ENTRY_SLIDE, ENTRY_SECONDS, ENTRY_FADE_SECONDS = 60, 0.36, 0.24
+EXIT_SLIDE, EXIT_SECONDS = 16, 0.32
+LAUNCH_RISE, LAUNCH_SECONDS = 24, 0.28   # pill-to-window
+LABEL_SECONDS, LABEL_LIFT = 0.18, 4
+CHIP_HOVER_SECONDS = 0.08
+WAVE_PERIOD, WAVE_LENGTH, WAVE_MID, WAVE_AMP = 1.6, 10.0, 12, 4
+DOT_PERIOD, DOT_STEP = 1.2, 0.2
+FLAG_POLL_SECONDS = 0.05
+IDLE_SHAPE = [0.30, 0.85, 0.30, 0.90, 0.55, 0.80, 0.95, 0.35,
+              0.60, 0.95, 0.80, 0.25, 0.85, 0.90, 0.55, 0.30, 0.50]
 
 # Live level meter: while recording, the bars follow the microphone. The pill
 # reads the tail of the WAV that pw-record/rec is writing (16-bit mono 16 kHz,
@@ -92,6 +132,7 @@ except OSError:
     RUNTIME_DIR = "/tmp"
 PID_FILE = os.path.join(RUNTIME_DIR, "xhisper-notify.pid")
 NEXT_STATE_FILE = os.path.join(RUNTIME_DIR, "xhisper-notify.next")
+ACK_FILE = os.path.join(RUNTIME_DIR, "xhisper-notify.ack")
 HISTORY_FILE = os.environ.get("XHISPER_HISTORY_FILE") or os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
     "xhisper", "history.jsonl")
@@ -114,6 +155,234 @@ def history_command():
     return sibling_command("xhisper-history")
 
 
+# ----- Layout and motion maths (mirrors macos/PillLayout.swift) -------------
+
+class Curve:
+    """A CSS cubic-bezier timing curve: maps elapsed fraction to progress."""
+
+    def __init__(self, x1, y1, x2, y2):
+        self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+
+    @staticmethod
+    def _bezier(u, a, b):
+        v = 1 - u
+        return 3 * v * v * u * a + 3 * v * u * u * b + u * u * u
+
+    def __call__(self, t):
+        if t <= 0:
+            return 0.0
+        if t >= 1:
+            return 1.0
+        u = t
+        for _ in range(8):
+            x = self._bezier(u, self.x1, self.x2) - t
+            if abs(x) < 1e-6:
+                return self._bezier(u, self.y1, self.y2)
+            v = 1 - u
+            dx = 3 * v * v * self.x1 + 6 * v * u * (self.x2 - self.x1) + 3 * u * u * (1 - self.x2)
+            if abs(dx) < 1e-6:
+                break
+            u -= x / dx
+        lo, hi, u = 0.0, 1.0, t
+        for _ in range(40):
+            x = self._bezier(u, self.x1, self.x2)
+            if abs(x - t) < 1e-7:
+                break
+            if x < t:
+                lo = u
+            else:
+                hi = u
+            u = (lo + hi) / 2
+        return self._bezier(u, self.y1, self.y2)
+
+
+CURVE_OUT = Curve(0.16, 1, 0.3, 1)
+CURVE_IN = Curve(0.4, 0, 1, 1)
+CURVE_STD = Curve(0.2, 0, 0, 1)
+CURVE_LINEAR = Curve(0, 0, 1, 1)
+
+
+class Tween:
+    """One eased value over time."""
+
+    def __init__(self, value, to=None, start=0.0, duration=0.0, curve=CURVE_STD):
+        self.frm, self.to = value, value if to is None else to
+        self.start, self.duration, self.curve = start, duration, curve
+
+    def value(self, t):
+        if self.duration <= 0:
+            return self.to
+        return self.frm + (self.to - self.frm) * self.curve((t - self.start) / self.duration)
+
+    def retarget(self, to, t, duration, curve=CURVE_STD):
+        return Tween(self.value(t), to, t, duration, curve)
+
+
+def bar_alpha(state):
+    return {"transcribing": 0.55, "editing": 0.55, "silent": 0.35, "cancelled": 0.30}.get(state, 1.0)
+
+
+def label_alpha(state):
+    return 0.62 if state == "cancelled" else 0.9
+
+
+def transition_seconds(state):
+    """How long the bars take to reach a state: (heights, opacity and colour)."""
+    return {"transcribing": (0.4, 0.24), "editing": (0.4, 0.24), "error": (0.24, 0.2),
+            "silent": (0.24, 0.24), "cancelled": (0.16, 0.16)}.get(state, (0, 0))
+
+
+def default_hold_ms(state):
+    """The design's holds, used when the caller passes no --timeout."""
+    return {"silent": 2400, "error": 2400, "cancelled": 900, "learned": 3000}.get(state)
+
+
+def close_delay(state, timeout_ms):
+    """Seconds until the exit starts, None = stays until told otherwise. A
+    caller's --timeout is the whole time on screen, exit included."""
+    if timeout_ms > 0:
+        return max(timeout_ms - int(EXIT_SECONDS * 1000), 100) / 1000
+    hold = default_hold_ms(state)
+    return None if hold is None else hold / 1000
+
+
+def accepts(frm, to):
+    return frm in UPDATABLE_STATES and to in FOLLOW_STATES
+
+
+def encode_handoff(state, timeout_ms):
+    return "%s %d" % (state, timeout_ms) if timeout_ms > 0 else state
+
+
+def decode_handoff(s):
+    parts = s.split()
+    if not parts:
+        return None
+    try:
+        timeout = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        timeout = 0
+    return parts[0], timeout
+
+
+def ack_accepted(ack, state):
+    """None until the pill has answered for this state."""
+    parts = ack.split()
+    if len(parts) != 2 or parts[0] != state:
+        return None
+    return parts[1] == "1"
+
+
+def split_notice(label):
+    """"Learned: a, b" -> ("Learned", ["a", "b"]); the words are drawn semibold."""
+    prefix, sep, rest = label.partition(": ")
+    if not sep:
+        return label, []
+    return prefix, [w for w in rest.split(", ") if w]
+
+
+def chip_rect(pill_width, chip_width):
+    return (pill_width - PAD_RIGHT - chip_width, (HEIGHT - CHIP_HEIGHT) / 2, chip_width, CHIP_HEIGHT)
+
+
+def hit_rect(pill_width, chip):
+    """The only click target: full height, from 6 left of the chip to the end."""
+    x = chip[0] - HIT_LEAD
+    return (x, 0, pill_width - x, HEIGHT)
+
+
+def in_rect(rect, x, y):
+    return rect[0] <= x <= rect[0] + rect[2] and rect[1] <= y <= rect[1] + rect[3]
+
+
+def dot_alpha(k, t):
+    """Dot k: 0.25 -> 1 -> 0.25 every 1.2 s, each 200 ms behind the one before."""
+    phase = (t - k * DOT_STEP) / DOT_PERIOD
+    return 0.25 + 0.75 * (0.5 - 0.5 * math.cos(2 * math.pi * phase))
+
+
+def slow_wave(i, t):
+    """Working: a sine across the bars, 8...16 tall, drifting left."""
+    return WAVE_MID + WAVE_AMP * math.sin(2 * math.pi * (t / WAVE_PERIOD + i / WAVE_LENGTH))
+
+
+def ridge(i):
+    """Failed: a still, low ridge 4...8 (period 8 bars)."""
+    return 8 - abs(i % 8 - 4)
+
+
+def live_height(level, i):
+    weight = 0.75 + 0.25 * math.sin(math.pi * (i + 0.5) / NUM_BARS)
+    return max(level * weight * MAX_BAR, MIN_BAR)
+
+
+def idle_height(i, t):
+    """Recording before the first audio arrives (a few tens of ms)."""
+    f = 0.7 + 0.3 * math.sin(t * 5 + i * 0.45)
+    return max(IDLE_SHAPE[i % len(IDLE_SHAPE)] * MAX_BAR * f, MIN_BAR)
+
+
+def still_height(state, i):
+    if state == "silent":
+        return 3
+    if state == "error":
+        return ridge(i)
+    if state == "cancelled":
+        return MIN_BAR  # 4 x 4 at radius 2: a dot
+    return None
+
+
+def reduce_motion():
+    try:
+        return not Gtk.Settings.get_default().props.gtk_enable_animations
+    except Exception:
+        return False
+
+
+def ui_font(size, weight=None):
+    """The desktop's UI font at an absolute pixel size."""
+    try:
+        name = Gtk.Settings.get_default().props.gtk_font_name or "Sans"
+    except Exception:
+        name = "Sans"
+    desc = Pango.FontDescription.from_string(name)
+    desc.set_absolute_size(size * Pango.SCALE)
+    desc.set_weight(weight if weight is not None else Pango.Weight.NORMAL)
+    return desc
+
+
+def rounded_rect(cr, x, y, w, h, r, new=True):
+    r = min(r, w / 2, h / 2)
+    if new:
+        cr.new_path()
+    else:
+        cr.new_sub_path()
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.close_path()
+
+
+def draw_shadow(cr, w, h, radius, alpha, blur, dy):
+    """A soft shadow outside a rounded rect (cairo has no blur: stacked
+    outlines fading out over `blur` pixels). Clipped to outside the shape,
+    as CSS draws a box-shadow, so a translucent surface does not show it."""
+    cr.save()
+    cr.new_path()
+    cr.rectangle(-SHADOW_MARGIN, -SHADOW_MARGIN, w + 2 * SHADOW_MARGIN, h + 2 * SHADOW_MARGIN)
+    rounded_rect(cr, 0, 0, w, h, radius)
+    cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+    cr.clip()
+    steps = max(2, int(blur))
+    for k in range(steps):
+        spread = blur * (1 - k / steps)
+        rounded_rect(cr, -spread / 2, dy - spread / 2, w + spread, h + spread, radius + spread / 2)
+        cr.set_source_rgba(0, 0, 0, alpha / steps * 1.6)
+        cr.fill()
+    cr.restore()
+
+
 # Base class is object when GTK is missing, so the module still imports and
 # main() can fall back to notify-send.
 class WavePill(Gtk.Window if HAS_GTK else object):
@@ -121,32 +390,57 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         wtype = Gtk.WindowType.TOPLEVEL if (IS_WAYLAND and HAS_LAYER_SHELL) else Gtk.WindowType.POPUP
         super().__init__(type=wtype)
         self.state = state
-        self.label = label or STATE_LABELS.get(state, state)
-        self.start_time = time.time()
-        self.fade_alpha = 0.0
-        self.slide_progress = 0.0
-        self.closing = False
-        self.use_layer_shell = IS_WAYLAND and HAS_LAYER_SHELL
-        # The chip is "History" on recording/silent pills and "Unlearn" on a
-        # learned pill (undo a correction that taught the wrong word).
+        self.learned = state == "learned"
+        self.notice = label or STATE_LABELS.get(state, state)
         self.unlearn = unlearn or []
-        if state == "learned" and self.unlearn:
-            self.show_chip, self.chip_label = True, "Unlearn"
-        else:
-            self.show_chip, self.chip_label = state in HISTORY_STATES and has_history(), CHIP_LABEL
-        self.show_waves = state != "learned"  # a text-only notice
-        self.chip_hover = False
-        self.pointer_inside = False
-        self.launch_start = None  # set when the History chip is clicked
+        self.unlearned = False
+        self.use_layer_shell = IS_WAYLAND and HAS_LAYER_SHELL
+        self.reduce = reduce_motion()
+        self.start_time = time.monotonic()
+        # The chip is "History" on dictation pills and "Unlearn" on a learned
+        # pill (undo a correction that taught the wrong word).
+        self.chip_label = "Unlearn" if self.learned else "History"
+        self.show_chip = bool(self.unlearn) if self.learned else (state in HISTORY_STATES and has_history())
+        self.label = (label or STATE_LABELS.get(state, state), state in WAVE_STATES, label_alpha(state))
+        self.old_label = None
+        self.label_start = -1.0
+        self.wav_path = os.environ.get("XHISPER_RECORDING") or os.path.join(RUNTIME_DIR, "xhisper.wav")
+        self.levels = [0.0] * NUM_BARS
+        self.level = 0.0
+        self.noise_floor = None
+        self.peak_db = None
+        self.last_push = 0.0
         self.live = False  # True once the recording file yields audio
-        self.blend_start = None  # set when recording turns into transcribing
-        if state == "recording":
-            self.wav_path = os.environ.get("XHISPER_RECORDING") or os.path.join(RUNTIME_DIR, "xhisper.wav")
-            self.levels = [0.0] * NUM_BARS
-            self.last_push = 0.0
-            self.level = 0.0
-            self.noise_floor = None
-            self.peak_db = None
+        self.heights_from = None  # frozen bars easing into the state's own
+        self.heights_start = 0.0
+        self.heights_seconds = 0.0
+        self.bar_alpha = Tween(bar_alpha(state))
+        self.coral_mix = Tween(1.0 if state == "error" else 0.0)
+        self.chip_fill = Tween(CHIP_FILL["rest"])
+        self.chip_hover = False
+        self.chip_pressed = False
+        self.pointer_inside = False
+        self.last_flag_check = -1.0
+        self.history_flag = os.environ.get("XHISPER_HISTORYFLAG") or None
+        self.phase = "shown"       # shown, closing, launching
+        self.phase_from = (0.0, 1.0)
+        self.phase_start = time.monotonic()
+        self.close_generation = 0
+        self.input_hit = "unset"
+        self.cur_pos = None
+
+        self.label_font = ui_font(12, Pango.Weight.MEDIUM)
+        self.chip_font = ui_font(11, Pango.Weight.MEDIUM)
+        self.notice_font = ui_font(13)
+        chip_w = math.ceil(self.text_width(self.chip_label, self.chip_font) + 2 * CHIP_PAD)
+        if self.learned:
+            lead = LEARNED_PAD_LEFT + CHECK_SIZE + LEARNED_GAP + self.notice_width()
+            tail = (LEARNED_CHIP_GAP + chip_w + PAD_RIGHT) if self.unlearn else LEARNED_PAD_LEFT
+            self.pill_width = max(LEARNED_MIN_WIDTH, math.ceil(lead + tail))
+        else:
+            self.pill_width = WIDTH
+        self.chip = chip_rect(self.pill_width, chip_w)
+        self.hit = hit_rect(self.pill_width, self.chip)
 
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
@@ -154,52 +448,43 @@ class WavePill(Gtk.Window if HAS_GTK else object):
             self.set_visual(visual)
         self.set_app_paintable(True)
         self.set_decorated(False)
-
-        # Dimensions
-        # The learned pill is read, not glanced at: bigger text and button.
-        self.big = state == "learned"
-        self.pill_height = 60 if self.big else 48
-        self.font_size = 17 if self.big else 13
-        self.chip_font_size = 14 if self.big else 12
-        self.max_bar_height = self.pill_height - 14
-        self.wave_x = 20
-        self.measure()
-        self.set_size_request(self.pill_width, self.pill_height + 4)
+        self.win_w = self.pill_width + 2 * SHADOW_MARGIN
+        self.win_h = HEIGHT + 2 * SHADOW_MARGIN
+        self.set_size_request(self.win_w, self.win_h)
+        self.shadow_cache = None
 
         if self.use_layer_shell:
-            # Wayland: use layer-shell to anchor at bottom-center
+            # Wayland: layer-shell anchors the window at bottom-center
             GtkLayerShell.init_for_window(self)
             GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
             GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
             GtkLayerShell.set_exclusive_zone(self, -1)
-            self.hidden_margin = -(self.pill_height + 10)
-            self.visible_margin = 55
-            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, self.hidden_margin)
+            self.rest_margin = BOTTOM_GAP - SHADOW_MARGIN
         else:
-            # X11: position at bottom-center, slide up from below
+            # X11: bottom centre of the pointer's monitor, above the dock.
             display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            geom = monitor.get_geometry()
-            self.target_x = geom.x + (geom.width - self.pill_width) // 2
-            self.screen_bottom = geom.y + geom.height
-            self.target_y = self.screen_bottom - self.pill_height - 55
-            self.slide_distance = 60
-            self.move(self.target_x, self.screen_bottom)
+            monitor = None
+            try:
+                _screen, px, py = display.get_default_seat().get_pointer().get_position()[:3]
+                monitor = display.get_monitor_at_point(px, py)
+            except Exception:
+                pass
+            monitor = monitor or display.get_primary_monitor() or display.get_monitor(0)
+            area = monitor.get_workarea()
+            self.rest_x = area.x + (area.width - self.pill_width) // 2 - SHADOW_MARGIN
+            self.rest_y = area.y + area.height - BOTTOM_GAP - HEIGHT - SHADOW_MARGIN
+        self.place(*self.pose(time.monotonic()))
 
         self.connect('draw', self.on_draw)
-        if self.show_chip:
-            self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
-                            | Gdk.EventMask.POINTER_MOTION_MASK
-                            | Gdk.EventMask.ENTER_NOTIFY_MASK
-                            | Gdk.EventMask.LEAVE_NOTIFY_MASK)
-            self.connect('button-press-event', self.on_click)
-            self.connect('motion-notify-event', self.on_motion)
-            self.connect('enter-notify-event', self.on_enter)
-            self.connect('leave-notify-event', self.on_leave)
-        GLib.timeout_add(16 if (self.show_chip or state == "recording") else 33, self.on_tick)
+        self.connect('realize', lambda *_: self.update_input_shape())
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        self.connect('button-press-event', self.on_press)
+        self.connect('button-release-event', self.on_release)
+        GLib.timeout_add(16, self.on_tick)
 
-        if timeout_ms > 0:
-            GLib.timeout_add(max(timeout_ms - 500, 100), self.start_close)
+        delay = close_delay(state, timeout_ms)
+        if delay is not None:
+            self.schedule_close(delay)
 
         # Last line of defence: recording/transcribing/editing carry no timeout,
         # so a pill whose registration went missing used to stay on screen until
@@ -210,131 +495,250 @@ class WavePill(Gtk.Window if HAS_GTK else object):
 
         self.show_all()
 
-    def measure(self):
-        """Width of the pill for the current label and chip."""
-        wave_w = NUM_BARS * BAR_WIDTH + (NUM_BARS - 1) * BAR_GAP
-        if self.big:
-            # Measure: the 8 px-per-character estimate is too tight at this size.
-            probe = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
-            probe.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            probe.set_font_size(self.font_size)
-            text_w = int(probe.text_extents(self.label).x_advance) + 24
-        else:
-            chars = len(self.label)
-            if self.state in UPDATABLE_STATES:
-                # Room for "Transcribing" from the start: the pill must not
-                # change size when its text does.
-                chars = max(chars, len(WORKING_LABEL))
-            text_w = (chars + 3) * 8 + 8
-        if self.show_waves:
-            self.text_x = self.wave_x + NUM_BARS * (BAR_WIDTH + BAR_GAP) + 8
-            self.pill_width = 24 + wave_w + 16 + text_w + 20
-        else:
-            self.text_x = 26 if self.big else 24
-            self.pill_width = self.text_x + text_w + 12
-        if self.show_chip:
-            self.chip_w, self.chip_h = (92, 36) if self.big else (72, 28)
-            self.chip_x = self.pill_width - 8
-            self.chip_y = (self.pill_height - self.chip_h) / 2
-            self.pill_width += self.chip_w + 2
+    # ----- text --------------------------------------------------------------
 
-    def update_state(self, next_state):
+    def layout(self, text, font, markup=False):
+        layout = PangoCairo.create_layout(cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)))
+        layout.set_font_description(font)
+        if markup:
+            layout.set_markup(text, -1)
+        else:
+            layout.set_text(text, -1)
+        return layout
+
+    def text_width(self, text, font):
+        return self.layout(text, font).get_pixel_extents()[1].width
+
+    def notice_markup(self):
+        """"Learned" regular + the words semibold (", " between them)."""
+        prefix, words = split_notice(self.notice)
+        esc = GLib.markup_escape_text
+        plain = '<span foreground="#CCC7BA" alpha="90%%">%s</span>'
+        out = plain % esc(prefix + (" " if words else ""))
+        for i, word in enumerate(words):
+            if i:
+                out += plain % ", "
+            out += '<span weight="600" foreground="#EDE8D9">%s</span>' % esc(word)
+        return out
+
+    def notice_width(self):
+        return self.layout(self.notice_markup(), self.notice_font, markup=True).get_pixel_extents()[1].width
+
+    # ----- state ---------------------------------------------------------------
+
+    @property
+    def leaving(self):
+        return self.phase != "shown"
+
+    def holds_under_pointer(self):
+        """No sound / Failed / Learned wait for the pointer to leave. A dictation
+        pill goes at once (the user's attention is on the pasted text), and so
+        does Cancelled: a quiet acknowledgement of Escape."""
+        return self.state in ("silent", "error", "learned") and not self.unlearned
+
+    def update_state(self, next_state, timeout_ms=0):
         """A later stage of the same dictation, applied to this pill where it
-        stands: no new window, no slide-in. See IN_PLACE_STATES."""
-        if self.launch_start is not None or self.closing:
-            return
-        # A pill of another kind (a Learned notice, a final pill) is not ours to
-        # turn into a dictation stage.
-        if self.state not in UPDATABLE_STATES:
-            return
+        stands: no new window, no slide-in, no resize. See IN_PLACE_STATES.
+        False when this pill cannot take it (another kind of pill, or one on
+        its way out)."""
+        if self.leaving or not accepts(self.state, next_state):
+            return False
         if next_state == "done":
             self.start_close()
+            return True
+        if next_state == self.state or (self.state == "editing" and next_state == "transcribing"):
+            return True
+        t = time.monotonic()
+        # Freeze the bars where they stand and ease them into the new state's
+        # (wave to wave needs nothing: the wave just goes on).
+        if not (self.state in WAVE_STATES and next_state in WAVE_STATES):
+            self.heights_from = [self.bar_height(i, t) for i in range(NUM_BARS)]
+            self.heights_start = t
+        heights, alpha = transition_seconds(next_state)
+        self.heights_seconds = heights
+        self.bar_alpha = self.bar_alpha.retarget(bar_alpha(next_state), t, alpha)
+        self.coral_mix = self.coral_mix.retarget(1.0 if next_state == "error" else 0.0, t, alpha)
+        self.state = next_state
+        self.set_label((STATE_LABELS.get(next_state, next_state), next_state in WAVE_STATES,
+                        label_alpha(next_state)), t)
+        delay = close_delay(next_state, timeout_ms)
+        if delay is not None:
+            self.schedule_close(delay)
+        self.queue_draw()
+        return True
+
+    def set_label(self, label, t):
+        if label == self.label:
             return
-        if self.state != "recording":
-            return
-        # Same window, same size, same chip: only the text and the bars change.
-        # The live bars are frozen where they stand and eased into the wave.
-        t = time.time() - self.start_time
-        self.blend_from = [self.bar_height(i, t) for i in range(NUM_BARS)]
-        self.blend_start = time.time()
-        self.state = "transcribing"
-        self.label = WORKING_LABEL
+        self.old_label = self.label
+        self.label = label
+        self.label_start = t
+
+    def schedule_close(self, seconds):
+        """Only the latest schedule counts (a final state replaces any earlier one)."""
+        self.close_generation += 1
+        generation = self.close_generation
+
+        def fire():
+            if generation == self.close_generation:
+                self.start_close()
+            return False
+        GLib.timeout_add(max(1, int(seconds * 1000)), fire)
 
     def start_close(self):
-        if self.launch_start is not None:
+        if self.leaving:
             return False
-        # Never slide away from under the pointer: the user may be reaching
-        # for the History chip. A finished dictation goes at once, hovered or not.
-        if self.pointer_inside and self.state not in UPDATABLE_STATES:
+        # Never slide away from under the pointer: the user may be reaching for the chip.
+        if self.pointer_inside and self.holds_under_pointer():
             GLib.timeout_add(400, self.start_close)
             return False
-        self.closing = True
-        GLib.timeout_add(600, lambda: Gtk.main_quit() or False)
+        t = time.monotonic()
+        self.phase_from = self.pose(t)
+        self.phase, self.phase_start = "closing", t
+        self.update_input_shape()
+        GLib.timeout_add(int(EXIT_SECONDS * 1000), lambda: Gtk.main_quit() or False)
         return False
 
-    def in_chip(self, x, y):
-        return (self.chip_x <= x <= self.chip_x + self.chip_w
-                and self.chip_y <= y <= self.chip_y + self.chip_h)
+    # ----- pointer -----------------------------------------------------------
 
-    def on_enter(self, _widget, _event):
-        self.pointer_inside = True
+    def update_input_shape(self):
+        """Clicks go through to the app below, except on the chip's hit area."""
+        window = self.get_window()
+        if window is None:
+            return
+        hit = self.hit if (self.show_chip and not self.leaving) else None
+        if hit == self.input_hit:
+            return
+        self.input_hit = hit
+        region = cairo.Region()
+        if hit:
+            region = cairo.Region(cairo.RectangleInt(int(hit[0] + SHADOW_MARGIN), int(hit[1] + SHADOW_MARGIN),
+                                                     int(math.ceil(hit[2])), int(hit[3])))
+        self.input_shape_combine_region(region)
 
-    def on_leave(self, _widget, _event):
-        self.pointer_inside = False
-        self.set_chip_hover(False)
-
-    def on_motion(self, _widget, event):
-        self.set_chip_hover(self.in_chip(event.x, event.y))
+    def poll_pointer(self):
+        """Hover from wherever the pointer is (the pill takes no pointer events
+        outside its chip, so it cannot rely on enter/leave)."""
+        try:
+            _screen, px, py = Gdk.Display.get_default().get_default_seat().get_pointer().get_position()[:3]
+        except Exception:
+            return
+        if self.cur_pos is None:
+            return  # layer-shell: no global pointer position on Wayland
+        x, y = px - self.cur_pos[0] - SHADOW_MARGIN, py - self.cur_pos[1] - SHADOW_MARGIN
+        self.pointer_inside = 0 <= x <= self.pill_width and 0 <= y <= HEIGHT
+        self.set_chip_hover(self.show_chip and not self.leaving and in_rect(self.hit, x, y))
 
     def set_chip_hover(self, hover):
         if hover == self.chip_hover:
             return
         self.chip_hover = hover
+        if not self.chip_pressed:
+            self.chip_fill = self.chip_fill.retarget(CHIP_FILL["hover" if hover else "rest"], time.monotonic(),
+                                                     CHIP_HOVER_SECONDS, CURVE_LINEAR)
         window = self.get_window()
         if window:
-            cursor = Gdk.Cursor.new_from_name(self.get_display(), "pointer") if hover else None
-            window.set_cursor(cursor)
+            window.set_cursor(Gdk.Cursor.new_from_name(self.get_display(), "pointer") if hover else None)
 
-    def on_click(self, _widget, event):
-        if event.button != 1 or not self.in_chip(event.x, event.y) or self.launch_start is not None:
+    def on_press(self, _widget, event):
+        x, y = event.x - SHADOW_MARGIN, event.y - SHADOW_MARGIN
+        if event.button != 1 or not self.show_chip or self.leaving or not in_rect(self.hit, x, y):
             return False
-        if self.state == "learned":
-            return self.do_unlearn()
+        self.chip_pressed = True
+        self.chip_fill = Tween(CHIP_FILL["pressed"])  # pressed is instant
+        self.queue_draw()
+        if self.learned:
+            # Let the pressed fill show before unlearning blocks for a moment.
+            GLib.timeout_add(50, lambda: self.do_unlearn() and False)
+            return True
         if self.state == "recording":
-            # Stop listening: xhisper.sh sees the flag, drops the recording,
-            # plays the cancel sound and leaves this pill to finish its exit.
-            flag = os.environ.get("XHISPER_HISTORYFLAG")
-            if flag:
-                try:
-                    open(flag, "w").close()
-                except OSError:
-                    pass
+            self.drop_history_flag()
+        self.rise_into_history()
+        return True
+
+    def on_release(self, _widget, _event):
+        if not self.chip_pressed or self.leaving:
+            return False
+        self.chip_pressed = False
+        self.chip_fill = self.chip_fill.retarget(CHIP_FILL["hover" if self.chip_hover else "rest"],
+                                                 time.monotonic(), CHIP_HOVER_SECONDS, CURVE_LINEAR)
+        return True
+
+    def drop_history_flag(self):
+        """Stop listening: xhisper.sh sees the flag, drops the recording, plays
+        the cancel sound and leaves this pill to finish its exit."""
+        if self.history_flag:
+            try:
+                os.close(os.open(self.history_flag, os.O_WRONLY | os.O_CREAT, 0o600))
+            except OSError:
+                pass
+
+    def rise_into_history(self):
+        """Open the History window and lift into it, then quit."""
         try:
             subprocess.Popen([history_command()], stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
         except OSError:
             pass
-        self.launch_start = time.time()
+        t = time.monotonic()
+        self.phase_from = self.pose(t)
+        self.phase, self.phase_start = "launching", t
+        self.update_input_shape()
+        self.set_chip_hover(False)
         GLib.timeout_add(int(LAUNCH_SECONDS * 1000) + 40, lambda: Gtk.main_quit() or False)
-        return True
+
+    def check_history_flag(self, t):
+        """The hotkey's double tap drops the History flag without a click: the
+        recording pill answers it like a click on its chip."""
+        if self.state != "recording" or self.leaving or not self.history_flag \
+                or t - self.last_flag_check < FLAG_POLL_SECONDS:
+            return
+        self.last_flag_check = t
+        if os.path.exists(self.history_flag):
+            self.rise_into_history()
 
     def do_unlearn(self):
+        if self.unlearned:
+            return False  # a double click
         try:
             subprocess.run([sibling_command("xhisper-learn"), "remove", *self.unlearn],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=5)
-            self.label = "Unlearned: " + ", ".join(self.unlearn)
+            self.notice = "Unlearned: " + ", ".join(self.unlearn)
         except (OSError, subprocess.SubprocessError):
-            self.label = "Could not unlearn"
+            self.notice = "Could not unlearn"
+        self.unlearned = True  # let it close even under the pointer
         self.show_chip = False
+        self.chip_pressed = False
         self.set_chip_hover(False)
-        self.pointer_inside = False  # let it close even under the pointer
-        GLib.timeout_add(1400, self.start_close)
-        return True
+        self.update_input_shape()
+        self.schedule_close(1.4)
+        self.queue_draw()
+        return False
 
-    def ease_out_cubic(self, t):
-        return 1.0 - (1.0 - t) ** 3
+    # ----- animation ---------------------------------------------------------
+
+    def pose(self, t):
+        """(offset down from rest, opacity) for the current phase."""
+        elapsed = t - self.phase_start
+        if self.phase == "shown":
+            slide = 0 if self.reduce else ENTRY_SLIDE * (1 - CURVE_OUT(elapsed / ENTRY_SECONDS))
+            return slide, CURVE_OUT(elapsed / ENTRY_FADE_SECONDS)
+        offset, alpha = self.phase_from
+        if self.phase == "closing":
+            p = CURVE_IN(elapsed / EXIT_SECONDS)
+            return offset + (0 if self.reduce else EXIT_SLIDE * p), alpha * (1 - p)
+        p = CURVE_STD(elapsed / LAUNCH_SECONDS)
+        return offset - (0 if self.reduce else LAUNCH_RISE * p), alpha * (1 - p)
+
+    def place(self, offset, alpha):
+        self.alpha = alpha
+        if self.use_layer_shell:
+            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, int(self.rest_margin - offset))
+        else:
+            self.cur_pos = (self.rest_x, int(self.rest_y + offset))
+            self.move(*self.cur_pos)
 
     def read_db(self):
         """RMS of the newest audio in dBFS, or None if nothing is readable yet."""
@@ -356,10 +760,9 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         rms = math.sqrt(sum(x * x for x in samples) / len(samples))
         return 20 * math.log10(max(rms, 1.0) / 32768)
 
-    def sample_level(self):
+    def sample_level(self, now):
         """Push one bar value, normalised against the room's noise floor and
         the recent speech peak so any mic gain fills the pill."""
-        now = time.time()
         if now - self.last_push < LEVEL_PUSH_SECONDS:
             return
         self.last_push = now
@@ -381,127 +784,157 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         self.levels = self.levels[1:] + [self.level]
 
     def on_tick(self):
-        if self.state == "recording" and self.launch_start is None:
-            self.sample_level()
-        if self.launch_start is not None:
-            # Transition to the history window: the pill lifts toward where the
-            # window opens and fades out while the window fades in.
-            p = min(1.0, (time.time() - self.launch_start) / LAUNCH_SECONDS)
-            lift = 40 * self.ease_out_cubic(p)
-            self.fade_alpha = 1.0 - p
-            if self.use_layer_shell:
-                GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, int(self.visible_margin + lift))
-            else:
-                self.move(self.target_x, int(self.target_y - lift))
-            self.queue_draw()
-            return True
-        if not self.closing:
-            self.fade_alpha = min(1.0, self.fade_alpha + 0.12)
-            self.slide_progress = min(1.0, self.slide_progress + 0.08)
-        else:
-            self.fade_alpha = max(0.0, self.fade_alpha - 0.05)
-            self.slide_progress = max(0.0, self.slide_progress - 0.06)
-
-        eased = self.ease_out_cubic(self.slide_progress)
-
-        if self.use_layer_shell:
-            margin = int(self.hidden_margin + (self.visible_margin - self.hidden_margin) * eased)
-            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, margin)
-        else:
-            y = self.target_y + self.slide_distance * (1.0 - eased)
-            self.move(self.target_x, int(y))
-
+        t = time.monotonic()
+        if self.state == "recording" and not self.leaving:
+            self.sample_level(t)
+        self.check_history_flag(t)
+        self.poll_pointer()
+        self.update_input_shape()
+        self.place(*self.pose(t))
         self.queue_draw()
         return True
 
-    def rounded_rect(self, cr, x, y, w, h, r):
-        r = min(r, w / 2, h / 2)
-        cr.new_path()
-        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
-        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
-        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
-        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
-        cr.close_path()
+    def target_height(self, i, t):
+        if self.state == "recording":
+            return live_height(self.levels[i], i) if self.live else idle_height(i, t - self.start_time)
+        if self.state in WAVE_STATES:
+            return slow_wave(i, t - self.start_time)
+        still = still_height(self.state, i)
+        return MIN_BAR if still is None else still
 
     def bar_height(self, i, t):
-        if self.state == "recording" and self.live:
-            # Newest level enters on the right; the centre is a little taller
-            # so the pill keeps its shape.
-            weight = 0.75 + 0.25 * math.sin(math.pi * (i + 0.5) / NUM_BARS)
-            return max(self.levels[i] * weight * self.max_bar_height, BAR_WIDTH)
-        base = BASE_HEIGHTS[i] * self.max_bar_height
-        if self.state == "recording":
-            f = 0.7 + 0.3 * math.sin(t * 5 + i * 0.45)
-        elif self.state in ("transcribing", "editing"):
-            f = 0.75 + 0.15 * math.sin(t * 2.5 + i * 0.35)
-            if self.blend_start is not None:
-                p = (time.time() - self.blend_start) / BLEND_SECONDS
-                if p < 1.0:
-                    e = self.ease_out_cubic(p)
-                    return max(self.blend_from[i] * (1 - e) + base * f * e, BAR_WIDTH)
-        elif self.state in ("done", "learned"):
-            f = max(0.15, 1.0 - t * 1.5)
-        elif self.state in ("silent", "error", "cancelled"):
-            f = 0.2 + 0.05 * math.sin(t * 1.5 + i * 0.3)
-        else:
-            f = 0.5
-        return max(base * f, BAR_WIDTH)
+        target = self.target_height(i, t)
+        if self.heights_from is None or self.heights_seconds <= 0:
+            return target
+        e = CURVE_STD((t - self.heights_start) / self.heights_seconds)
+        return self.heights_from[i] + (target - self.heights_from[i]) * e
 
-    def on_draw(self, widget, cr):
-        t = time.time() - self.start_time
-        a = self.fade_alpha
-        h = self.pill_height
-        w = self.pill_width
-        r = h / 2
-        cy = h / 2
+    # ----- drawing -----------------------------------------------------------
 
+    def shadows(self):
+        """The two shadows (ambient 0 6 18, contact 0 1 2), drawn once."""
+        if self.shadow_cache is None:
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.win_w, self.win_h)
+            cr = cairo.Context(surface)
+            cr.translate(SHADOW_MARGIN, SHADOW_MARGIN)
+            draw_shadow(cr, self.pill_width, HEIGHT, HEIGHT / 2, 0.32, 18, 6)
+            draw_shadow(cr, self.pill_width, HEIGHT, HEIGHT / 2, 0.30, 2, 1)
+            self.shadow_cache = surface
+        return self.shadow_cache
+
+    def on_draw(self, _widget, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE)
         cr.set_source_rgba(0, 0, 0, 0)
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
+        a = getattr(self, "alpha", 0.0)
+        if a <= 0:
+            return False
+        self.draw_pill(cr, a, time.monotonic())
+        return False
 
-        self.rounded_rect(cr, 2, 3, w, h, r)
-        cr.set_source_rgba(0, 0, 0, 0.3 * a)
+    def draw_pill(self, cr, a, t):
+        cr.set_source_surface(self.shadows(), 0, 0)
+        cr.paint_with_alpha(a)
+        # Everything else is drawn at full strength in a group, then faded as one.
+        cr.push_group()
+        cr.translate(SHADOW_MARGIN, SHADOW_MARGIN)
+        w, h = self.pill_width, HEIGHT
+        cy = h / 2
+        rounded_rect(cr, 0, 0, w, h, h / 2)
+        cr.set_source_rgba(*SURFACE)
         cr.fill()
+        # 1 px inner edge: keeps the capsule readable over dark apps.
+        rounded_rect(cr, 0.5, 0.5, w - 1, h - 1, (h - 1) / 2)
+        cr.set_source_rgba(*EDGE)
+        cr.set_line_width(1)
+        cr.stroke()
 
-        self.rounded_rect(cr, 0, 0, w, h, r)
-        cr.set_source_rgba(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2], BG_COLOR[3] * a)
-        cr.fill()
-
-        bar_color = ERROR_BAR_COLOR if self.state == "error" else BAR_COLOR
-        for i in range(NUM_BARS if self.show_waves else 0):
-            bx = self.wave_x + i * (BAR_WIDTH + BAR_GAP)
-            bh = self.bar_height(i, t)
-            by = cy - bh / 2
-            self.rounded_rect(cr, bx, by, BAR_WIDTH, bh, BAR_RADIUS)
-            cr.set_source_rgba(bar_color[0], bar_color[1], bar_color[2], a)
-            cr.fill()
-
-        dots = ""
-        if self.state in ("recording", "transcribing", "editing"):
-            dots = "." * (int(t * 2) % 4)
-        tx = self.text_x
-        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-        cr.set_font_size(self.font_size)
-        ext = cr.text_extents(self.label + dots)
-        cr.move_to(tx, cy + ext.height / 2)
-        cr.set_source_rgba(TEXT_COLOR[0], TEXT_COLOR[1], TEXT_COLOR[2], TEXT_COLOR[3] * a)
-        cr.show_text(self.label + dots)
+        if self.learned:
+            self.draw_notice(cr, cy)
+        else:
+            self.draw_bars(cr, t, cy)
+            self.draw_labels(cr, t, cy)
 
         if self.show_chip:
-            launching = self.launch_start is not None
-            color = CHIP_HOVER_COLOR if (self.chip_hover or launching) else CHIP_COLOR
-            self.rounded_rect(cr, self.chip_x, self.chip_y, self.chip_w, self.chip_h, self.chip_h / 2)
-            cr.set_source_rgba(color[0], color[1], color[2], color[3] * a)
+            x, y, cw, ch = self.chip
+            rounded_rect(cr, x, y, cw, ch, ch / 2)
+            cr.set_source_rgba(1, 1, 1, self.chip_fill.value(t))
             cr.fill()
-            cr.set_font_size(self.chip_font_size)
-            ext = cr.text_extents(self.chip_label)
-            cr.move_to(self.chip_x + (self.chip_w - ext.width) / 2 - ext.x_bearing,
-                       cy + ext.height / 2)
-            cr.set_source_rgba(BAR_COLOR[0], BAR_COLOR[1], BAR_COLOR[2], a)
-            cr.show_text(self.chip_label)
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(self.chip_font)
+            layout.set_text(self.chip_label, -1)
+            ext = layout.get_pixel_extents()[1]
+            cr.move_to(x + (cw - ext.width) / 2 - ext.x, cy - ext.height / 2 - ext.y)
+            cr.set_source_rgb(*INK)
+            PangoCairo.show_layout(cr, layout)
+        cr.pop_group_to_source()
+        cr.paint_with_alpha(a)
 
-        return False
+    def draw_bars(self, cr, t, cy):
+        mix = self.coral_mix.value(t)
+        color = [INK[k] + (CORAL[k] - INK[k]) * mix for k in range(3)]
+        for i in range(NUM_BARS):
+            bh = self.bar_height(i, t)
+            bx = PAD_LEFT + i * (BAR_WIDTH + BAR_GAP)
+            rounded_rect(cr, bx, cy - bh / 2, BAR_WIDTH, bh, min(BAR_RADIUS, bh / 2), new=(i == 0))
+        cr.set_source_rgba(color[0], color[1], color[2], self.bar_alpha.value(t))
+        cr.fill()
+
+    def draw_labels(self, cr, t, cy):
+        """The label, crossfading with a 4 px lift when it changes."""
+        p = 1.0
+        if self.old_label is not None:
+            p = CURVE_STD((t - self.label_start) / LABEL_SECONDS)
+            if p >= 1:
+                self.old_label = None
+            else:
+                self.draw_label(cr, self.old_label, t, cy, 0 if self.reduce else -LABEL_LIFT * p, 1 - p)
+        self.draw_label(cr, self.label, t, cy, 0 if self.reduce else LABEL_LIFT * (1 - p), p)
+
+    def draw_label(self, cr, label, t, cy, dy, fade):
+        text, dots, alpha = label
+        if fade <= 0:
+            return
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(self.label_font)
+        layout.set_text(text, -1)
+        ink, logical = layout.get_pixel_extents()
+        y = cy - logical.height / 2 + dy
+        cr.move_to(LABEL_X, y)
+        cr.set_source_rgba(LABEL_INK[0], LABEL_INK[1], LABEL_INK[2], alpha * fade)
+        PangoCairo.show_layout(cr, layout)
+        if not dots:
+            return
+        # Three dots always laid out, pulsing in opacity: no text ever grows.
+        layout.set_text(".", -1)
+        for k in range(3):
+            cr.move_to(LABEL_X + logical.width + k * DOT_WIDTH, y)
+            cr.set_source_rgba(LABEL_INK[0], LABEL_INK[1], LABEL_INK[2],
+                               alpha * fade * dot_alpha(k, t - self.start_time))
+            PangoCairo.show_layout(cr, layout)
+
+    def draw_notice(self, cr, cy):
+        x = LEARNED_PAD_LEFT
+        if not self.unlearned:
+            # The check, success green, 12 px.
+            s = CHECK_SIZE
+            top = cy - s / 2
+            cr.move_to(x + s * 0.12, top + s * 0.55)
+            cr.line_to(x + s * 0.40, top + s * 0.82)
+            cr.line_to(x + s * 0.90, top + s * 0.20)
+            cr.set_source_rgb(*SUCCESS)
+            cr.set_line_width(2)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_line_join(cairo.LINE_JOIN_ROUND)
+            cr.stroke()
+            x += s + LEARNED_GAP
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(self.notice_font)
+        layout.set_markup(self.notice_markup(), -1)
+        logical = layout.get_pixel_extents()[1]
+        cr.move_to(x, cy - logical.height / 2)
+        PangoCairo.show_layout(cr, layout)
 
 
 def overlay_max_seconds():
@@ -537,25 +970,53 @@ def process_argv(pid):
         return []
 
 
-def hand_over(state):
+def hand_over(state, timeout_ms=0):
     """Pass an in-place state to the overlay already on screen. True if it was
-    delivered. Only an older overlay qualifies: a slow `done` from the last
-    dictation must not close the pill of the next one."""
+    delivered (and, for a final state, taken). Only an older overlay
+    qualifies: a slow `done` from the last dictation must not close the pill
+    of the next one."""
     pid = read_pid_file()
     me = os.getpid()
     if (pid is None or pid == me or not is_alive(pid)
             or not is_overlay_argv(process_argv(pid))
             or not is_older(pid, start_time(me), me)):
         return False
+    acked = state in ACKED_STATES
     try:
+        if acked:
+            try:
+                os.unlink(ACK_FILE)
+            except OSError:
+                pass
         tmp = NEXT_STATE_FILE + ".%d" % me
         with open(tmp, "w") as f:
-            f.write(state)
+            f.write(encode_handoff(state, timeout_ms))
         os.replace(tmp, NEXT_STATE_FILE)
         os.kill(pid, signal.SIGUSR1)
     except OSError:
         return False
-    return True
+    # A final state must be seen: if that pill cannot take it (a Learned
+    # notice, one on its way out), the caller shows its own pill instead.
+    return wait_for_ack(state) if acked else True
+
+
+def wait_for_ack(state):
+    """The pill's answer to a final state; False when it refused or is wedged."""
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        try:
+            with open(ACK_FILE) as f:
+                ok = ack_accepted(f.read(), state)
+        except OSError:
+            ok = None
+        if ok is not None:
+            try:
+                os.unlink(ACK_FILE)
+            except OSError:
+                pass
+            return ok
+        time.sleep(0.01)
+    return False
 
 
 def is_alive(pid):
@@ -687,6 +1148,7 @@ def kill_existing():
             pass
 
 
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: xhisper-notify <state> [--timeout MS] [--label TEXT] [--unlearn WORD,...]", file=sys.stderr)
@@ -718,7 +1180,7 @@ def main():
     # handed over in a file, then SIGUSR1; the pill installs its handler before
     # it registers its pid, so any pid found there will not die of the signal.
     if state in IN_PLACE_STATES:
-        if hand_over(state):
+        if hand_over(state, timeout_ms):
             return
         # Nothing on screen to update: a lone "done" shows nothing.
         if state == "done":
@@ -747,16 +1209,42 @@ def main():
     pill = None
     pending = []
 
+    def apply(handoff):
+        next_state, next_timeout = handoff
+        ok = pill.update_state(next_state, next_timeout)
+        if next_state in ACKED_STATES:
+            try:
+                tmp = ACK_FILE + ".%d" % os.getpid()
+                with open(tmp, "w") as f:
+                    f.write("%s %d" % (next_state, 1 if ok else 0))
+                os.replace(tmp, ACK_FILE)
+            except OSError:
+                pass
+
     def on_next_state():
+        # Claim the file before reading it: a read-then-unlink could delete a
+        # later state (a `done`) written in between, and leave the pill up.
+        mine = NEXT_STATE_FILE + ".claimed.%d" % os.getpid()
         try:
-            with open(NEXT_STATE_FILE) as f:
-                next_state = f.read().strip()
+            os.rename(NEXT_STATE_FILE, mine)
         except OSError:
             return GLib.SOURCE_CONTINUE
+        try:
+            with open(mine) as f:
+                handoff = decode_handoff(f.read())
+        except OSError:
+            handoff = None
+        finally:
+            try:
+                os.unlink(mine)
+            except OSError:
+                pass
+        if handoff is None:
+            return GLib.SOURCE_CONTINUE
         if pill is None:
-            pending[:] = [next_state]
+            pending.append(handoff)
         else:
-            pill.update_state(next_state)
+            apply(handoff)
         return GLib.SOURCE_CONTINUE
 
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, on_next_state)
@@ -766,8 +1254,8 @@ def main():
     write_pid_file()
 
     pill = WavePill(state=state, timeout_ms=timeout_ms, label=label, unlearn=unlearn)
-    if pending:
-        pill.update_state(pending.pop())
+    for handoff in pending:
+        apply(handoff)
     Gtk.main()
 
     release_pid_file()

@@ -1198,7 +1198,11 @@ cleanup() {
   # Terminal overlays (done/silent/error) are meant to stay on screen after we
   # exit, so only hide the ones that would otherwise linger forever.
   [ "$FINAL_OVERLAY" -eq 0 ] && hide_status
-  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$HISTORYFLAG" "$LLM_REQUEST" "$CONTEXT_FILE" "$BEFORE_FILE" "$TRANSCRIPT_FILE" "$WINDOW_FILE" "$WINDOW_CLASS_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
+  # A History cancel leaves its flag: the pill polls it (every 50 ms, ours
+  # every 25 ms) and must still see it to rise into the window. The next run
+  # clears it before its own pill comes up.
+  [ "${KEY_RC:-0}" -eq 5 ] || rm -f "$HISTORYFLAG"
+  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$LLM_REQUEST" "$CONTEXT_FILE" "$BEFORE_FILE" "$TRANSCRIPT_FILE" "$WINDOW_FILE" "$WINDOW_CLASS_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
   if [ -n "$SAVED_CLIPBOARD" ]; then
     printf '%s' "$SAVED_CLIPBOARD" | $CLIP_COPY
   fi

@@ -1,77 +1,50 @@
 #!/usr/bin/env python3
-"""xhisper-history: the last dictations, newest first, each with a Copy button.
+"""xhisper-history: the last dictations, newest first.
 
-Edit fixes a dictation in place; the words you corrected are learned
-(xhisper-learn diff) so Whisper and auto-edit spell them right next time.
+Each row has Edit, Copy and, when a text field had the focus as the window
+opened, Paste (into that field). Edit fixes a dictation in place; the words
+you corrected are learned (xhisper-learn diff) so Whisper and auto-edit spell
+them right next time.
 
-Opened by `xhisper --history` or by the History chip on the overlay pill.
-Reads $XHISPER_HISTORY_FILE (JSON lines written by xhisper.sh, already trimmed
-to history-size). Only one window exists at a time: a second launch raises it.
+Opened by `xhisper --history`, by the History chip on the overlay pill, or by
+a double tap of the xhisper-hotkey combo. Reads $XHISPER_HISTORY_FILE (JSON
+lines written by xhisper.sh, already trimmed to history-size). Only one
+window exists at a time: a second launch raises it.
+
+Look and motion follow design A (macos/History.swift, HistoryLayout.swift),
+the same numbers in logical pixels. The dictated text never goes to argv or
+to the log.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 
-try:
-    import gi
-    gi.require_version('Gtk', '3.0')
-    from gi.repository import Gtk, Gdk, GLib, Gio
-except (ImportError, ValueError):
-    print("xhisper-history: PyGObject (GTK 3) is required", file=sys.stderr)
-    sys.exit(1)
+IS_WAYLAND = os.environ.get('XDG_SESSION_TYPE') == 'wayland'
 
+
+def runtime_dir():
+    """Same rule as xhisper.sh: XHISPER_RUNTIME_DIR, else XDG_RUNTIME_DIR/xhisper."""
+    return os.environ.get("XHISPER_RUNTIME_DIR") or os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "xhisper")
+
+
+RUNTIME_DIR = runtime_dir()
+PID_FILE = os.path.join(RUNTIME_DIR, "xhisper-history.pid")
+PIPELINE_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper.pid")
+LOG_FILE = os.path.join(RUNTIME_DIR, "xhisper.log")
 HISTORY_FILE = os.environ.get("XHISPER_HISTORY_FILE") or os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
     "xhisper", "history.jsonl")
-IS_WAYLAND = os.environ.get('XDG_SESSION_TYPE') == 'wayland'
-FADE_MS = 220
-SLIDE_PX = 24
-
-# Same palette as the overlay pill.
-CSS = b"""
-#xhisper-history { background-color: #1a1a1a; }
-#xhisper-history headerbar { background: #1a1a1a; border: none; box-shadow: none; }
-#xhisper-history .entry { background-color: #262626; border-radius: 12px; padding: 10px 12px; }
-#xhisper-history .when { color: #8f8b84; font-size: 11px; }
-#xhisper-history .text { color: #eeeae0; }
-#xhisper-history .empty { color: #8f8b84; }
-#xhisper-history button.copy { border-radius: 8px; min-width: 72px; }
-#xhisper-history textview, #xhisper-history textview text { background-color: #303030; color: #eeeae0; }
-#xhisper-history .editor { border-radius: 8px; border: 1px solid #555; padding: 4px; }
-"""
-
-
-def load_entries():
-    entries = []
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(entry, dict) and entry.get("text"):
-                    entries.append(entry)
-    except OSError:
-        pass
-    return list(reversed(entries))
-
-
-def describe_time(stamp):
-    try:
-        when = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z").astimezone()
-    except (TypeError, ValueError):
-        return stamp or ""
-    today = datetime.now().astimezone().date()
-    if when.date() == today:
-        return "Today " + when.strftime("%H:%M")
-    if when.date() == today - timedelta(days=1):
-        return "Yesterday " + when.strftime("%H:%M")
-    return when.strftime("%d %b %H:%M")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "xhisper")
+SIZE_FILE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                         "xhisper", "history-window.json")
 
 
 def sibling(name):
@@ -80,42 +53,412 @@ def sibling(name):
     return path if os.access(path, os.X_OK) else name
 
 
-def learn_from_edit(old, new):
-    """Learn the corrected words; returns them (empty if nothing was learned)."""
+def log(message):
+    """Paste steps go to xhisper.log (never the text): a paste that lands
+    nowhere is otherwise invisible."""
     try:
-        result = subprocess.run([sibling("xhisper-learn"), "diff"],
-                                input=json.dumps({"old": old, "new": new}).encode("utf-8"),
-                                capture_output=True, timeout=10)
-        return result.stdout.decode("utf-8").split()
-    except (OSError, subprocess.SubprocessError):
-        return []
-
-
-def update_history(entry, new_text):
-    """Replace one entry's text in place (matched on time and old text)."""
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            lines = f.readlines()
+        old = os.umask(0o077)
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write("History: %s\n" % message)
+        finally:
+            os.umask(old)
     except OSError:
-        return
+        pass
+
+
+def run(cmd, timeout=2, data=None):
+    """stdout of a short helper, or None."""
+    try:
+        out = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
+        return out.stdout.decode("utf-8", "replace").strip() if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def active_window():
+    """The X11 window that has the focus (id, pid, class), or None. Taken
+    before our own window exists: that is where Paste goes."""
+    if IS_WAYLAND or not shutil.which("xdotool"):
+        return None
+    wid = run(["xdotool", "getactivewindow"], timeout=1)
+    if not wid or not wid.isdigit():
+        return None
+    pid = run(["xdotool", "getwindowpid", wid], timeout=1)
+    return {"id": wid, "pid": int(pid) if pid and pid.isdigit() else None, "class": window_class(wid)}
+
+
+def window_class(wid):
+    """WM_CLASS as xhisper.sh reads it ("instance,Class"); xdotool before
+    2021 has no getwindowclassname, so xprop."""
+    klass = run(["xdotool", "getwindowclassname", wid], timeout=1)
+    if not klass and shutil.which("xprop"):
+        out = run(["xprop", "-id", wid, "WM_CLASS"], timeout=1) or ""
+        if "=" in out:
+            klass = ",".join(p.strip().strip('"') for p in out.split("=", 1)[1].split(","))
+    return klass or ""
+
+
+# Taken at once, before GTK loads and long before our window maps (not when
+# the tests import this file).
+LAUNCH_TARGET = active_window() if __name__ == "__main__" else None
+
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib, Gio, Pango
+    import cairo
+except (ImportError, ValueError):
+    print("xhisper-history: PyGObject (GTK 3) is required", file=sys.stderr)
+    sys.exit(1)
+try:
+    gi.require_version('GdkX11', '3.0')
+    from gi.repository import GdkX11
+except (ImportError, ValueError):
+    GdkX11 = None
+
+
+# ----- Design tokens (macos/History.swift HistoryStyle, A9 §2-3) -------------
+
+INK = "#EDE8D9"                         # ink.primary 237,232,217
+INK_LABEL = "rgba(204,199,186,0.90)"
+INK_SECONDARY = "rgba(204,199,186,0.62)"
+SUCCESS = "rgb(150,200,140)"
+ERROR = "rgb(232,115,102)"
+SURFACE = (26 / 255, 26 / 255, 26 / 255, 0.97)  # 0.90 over a blur on macOS; X11 has no blur
+EDGE = (1, 1, 1, 0.08)
+RADIUS = 19                    # the pill's end radius
+SHADOW = 24                    # room for the window's own shadow (no WM shadow when undecorated)
+DEFAULT_SIZE = (440, 520)
+MIN_SIZE = (360, 260)
+BOTTOM_GAP = 55                # bottom edge on the pill's line
+SCREEN_MARGIN = 12
+HEIGHT_RESERVE = 120
+GRAB = 6                       # resize band inside the card's edges
+CORNER_SPAN = 19
+LINE_HEIGHT = 18
+
+CSS = """
+#xhisper-history { background: transparent; }
+#xhisper-history * { text-shadow: none; -gtk-icon-shadow: none; outline-width: 0; }
+#xhisper-history label { color: %(ink)s; }
+#xhisper-history .title { font-size: 13px; font-weight: 600; }
+#xhisper-history .sep { background-color: rgba(255,255,255,0.06); min-height: 1px; }
+#xhisper-history .row { border-radius: 11px; padding: 6px 12px 12px 12px;
+    background-color: rgba(255,255,255,0); transition: background-color 100ms cubic-bezier(0.4,0,1,1); }
+#xhisper-history .row.hover { background-color: rgba(255,255,255,0.04);
+    transition: background-color 100ms cubic-bezier(0.16,1,0.3,1); }
+#xhisper-history .row.target, #xhisper-history .row.editing { background-color: rgba(255,255,255,0.06); }
+#xhisper-history .row.target.hover { background-color: rgba(255,255,255,0.08); }
+#xhisper-history .row.flash { background-color: rgba(237,232,217,0.10); transition: none; }
+#xhisper-history .row.flash-out { transition: background-color 900ms cubic-bezier(0.16,1,0.3,1); }
+#xhisper-history .time { color: %(secondary)s; font-size: 11px; font-weight: 500;
+    font-feature-settings: "tnum"; }
+#xhisper-history .entry { font-size: 13px; }
+#xhisper-history .entry selection { background-color: rgba(237,232,217,0.25); color: %(ink)s; }
+#xhisper-history button { background-image: none; border: none; box-shadow: none;
+    padding: 0; margin: 0; min-height: 0; min-width: 0; }
+#xhisper-history button.icon { min-width: 28px; min-height: 28px; border-radius: 14px;
+    background-color: rgba(255,255,255,0); color: %(label)s; transition: background-color 80ms linear; }
+#xhisper-history button.icon:hover { background-color: rgba(255,255,255,0.10); color: %(ink)s; }
+#xhisper-history button.icon:active { background-color: rgba(255,255,255,0.18); transition: none; }
+#xhisper-history button.icon.copied { background-color: rgba(150,200,140,0.14); color: %(success)s; }
+#xhisper-history button.icon.copied label { color: %(success)s; }
+#xhisper-history button.primary { min-height: 28px; border-radius: 14px; background-color: %(ink)s;
+    transition: background-color 80ms linear; }
+#xhisper-history button.primary label { color: #1A1A1A; font-size: 12px; font-weight: 600; }
+#xhisper-history button.primary .glyph { color: rgba(26,26,26,0.5); font-size: 11px; }
+#xhisper-history button.primary image { color: #1A1A1A; }
+#xhisper-history button.primary:hover { background-color: #F8F4E9; }
+#xhisper-history button.primary:active { background-color: #D4CFC1; transition: none; }
+#xhisper-history button.ghost { min-height: 28px; border-radius: 14px;
+    background-color: rgba(255,255,255,0.10); transition: background-color 80ms linear; }
+#xhisper-history button.ghost label { font-size: 12px; font-weight: 500; }
+#xhisper-history button.ghost:hover { background-color: rgba(255,255,255,0.18); }
+#xhisper-history button.ghost:active { background-color: rgba(255,255,255,0.26); transition: none; }
+#xhisper-history button.close { min-width: 24px; min-height: 24px; margin: 2px; border-radius: 12px;
+    background-color: rgba(255,255,255,0.08); color: %(label)s; transition: background-color 80ms linear; }
+#xhisper-history button.close:hover { background-color: rgba(255,255,255,0.16); }
+#xhisper-history button.close:active { background-color: rgba(255,255,255,0.24); transition: none; }
+#xhisper-history button.more { min-height: 20px; margin: 2px 0; padding: 0 2px; border-radius: 4px;
+    background-color: transparent; color: %(label)s; }
+#xhisper-history button.more label { font-size: 11px; font-weight: 500; color: %(label)s; }
+#xhisper-history button.more:hover label, #xhisper-history button.more:hover { color: %(ink)s; }
+#xhisper-history button.more:active label { color: rgba(237,232,217,0.7); }
+#xhisper-history .keycap { background-color: rgba(255,255,255,0.08); border-radius: 5px;
+    padding: 0 5px; min-width: 8px; min-height: 18px; font-size: 11px; font-weight: 500; color: %(label)s; }
+#xhisper-history .hint { font-size: 11px; color: %(secondary)s; }
+#xhisper-history .field { background-color: rgba(0,0,0,0.28); border: 1px solid rgba(237,232,217,0.55);
+    border-radius: 8px; }
+#xhisper-history .field.failed { border-color: %(error)s; }
+#xhisper-history .field textview, #xhisper-history .field textview text,
+#xhisper-history .field scrolledwindow { background-color: transparent; color: %(ink)s; font-size: 13px;
+    caret-color: %(ink)s; }
+#xhisper-history .field textview text selection { background-color: rgba(237,232,217,0.25); }
+#xhisper-history .toast { background-color: rgba(40,40,40,0.98); border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 17px; min-height: 32px; padding: 0 14px 0 12px; }
+#xhisper-history .toast.with-chip { padding-right: 5px; }
+#xhisper-history .toast label { font-size: 12px; color: %(label)s; }
+#xhisper-history .toast .ok { color: %(success)s; }
+#xhisper-history .toast .bad, #xhisper-history .toast label.bad { color: %(error)s; font-weight: 500; }
+#xhisper-history button.chip { min-height: 24px; margin: 2px 0; padding: 0 10px; border-radius: 12px;
+    background-color: rgba(255,255,255,0.10); transition: background-color 80ms linear; }
+#xhisper-history button.chip label { font-size: 12px; font-weight: 500; color: %(ink)s; }
+#xhisper-history button.chip:hover { background-color: rgba(255,255,255,0.22); }
+#xhisper-history button.chip:active { background-color: rgba(255,255,255,0.30); transition: none; }
+#xhisper-history button.newchip { min-height: 24px; padding: 0 10px 0 8px; border-radius: 12px;
+    background-color: rgba(48,48,48,0.98); border: 1px solid rgba(255,255,255,0.10); color: %(ink)s; }
+#xhisper-history button.newchip label { font-size: 11px; font-weight: 500; }
+#xhisper-history .empty-title { font-size: 13px; font-weight: 600; color: rgba(237,232,217,0.9); }
+#xhisper-history .empty-body { font-size: 12px; color: %(secondary)s; }
+#xhisper-history scrollbar { background: transparent; border: none; }
+#xhisper-history scrollbar slider { background-color: rgba(255,255,255,0.32); border: none;
+    min-width: 6px; border-radius: 3px; }
+""" % {"ink": INK, "label": INK_LABEL, "secondary": INK_SECONDARY, "success": SUCCESS, "error": ERROR}
+
+
+# ----- Motion ----------------------------------------------------------------
+
+class Curve:
+    """A CSS cubic-bezier timing curve: maps elapsed fraction to progress."""
+
+    def __init__(self, x1, y1, x2, y2):
+        self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+
+    @staticmethod
+    def _bezier(u, a, b):
+        v = 1 - u
+        return 3 * v * v * u * a + 3 * v * u * u * b + u * u * u
+
+    def __call__(self, t):
+        if t <= 0:
+            return 0.0
+        if t >= 1:
+            return 1.0
+        lo, hi, u = 0.0, 1.0, t
+        for _ in range(40):
+            x = self._bezier(u, self.x1, self.x2)
+            if abs(x - t) < 1e-6:
+                break
+            if x < t:
+                lo = u
+            else:
+                hi = u
+            u = (lo + hi) / 2
+        return self._bezier(u, self.y1, self.y2)
+
+
+CURVE_OUT = Curve(0.16, 1, 0.3, 1)
+CURVE_IN = Curve(0.4, 0, 1, 1)
+CURVE_STD = Curve(0.2, 0, 0, 1)
+
+
+class Tween:
+    """One animation on the GLib clock: `step` gets the eased progress 0..1."""
+
+    def __init__(self, duration, curve, step, done=None, delay=0.0):
+        self.start = time.monotonic() + delay
+        self.duration, self.curve, self.step, self.done = duration, curve, step, done
+        self.source = None
+        step(0.0)
+        self.source = GLib.timeout_add(16, self.tick)
+
+    def tick(self):
+        p = (time.monotonic() - self.start) / self.duration if self.duration > 0 else 1
+        if p < 0:
+            return True  # still in the delay
+        self.step(self.curve(p))
+        if p >= 1:
+            self.source = None
+            if self.done:
+                self.done()
+            return False
+        return True
+
+    def stop(self):
+        if self.source:
+            GLib.source_remove(self.source)
+            self.source = None
+
+
+def reduce_motion():
+    try:
+        return not Gtk.Settings.get_default().props.gtk_enable_animations
+    except Exception:
+        return False
+
+
+# ----- The history file (macos/HistoryStore.swift) ---------------------------
+
+def load_entries(path=HISTORY_FILE):
+    """Newest first, as (time, text) tuples."""
+    entries = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"]:
+                    entries.append((str(item.get("time") or ""), item["text"]))
+    except OSError:
+        pass
+    return list(reversed(entries))
+
+
+def describe_time(stamp, now=None):
+    """"Just now" under 1 min, "N min ago" under 60 min, "N h ago" under 6 h,
+    then "Today 09:12", "Yesterday 14:03", "Mon 17:20" under 7 days, else
+    "12 Oct 09:30". 24 h clock. Future stamps read "Just now"."""
+    try:
+        when = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z").astimezone()
+    except (TypeError, ValueError):
+        return stamp or ""
+    now = now or datetime.now().astimezone()
+    age = (now - when).total_seconds()
+    if age < 60:
+        return "Just now"
+    if age < 3600:
+        return "%d min ago" % int(age // 60)
+    if age < 6 * 3600:
+        return "%d h ago" % int(age // 3600)
+    clock = when.strftime("%H:%M")
+    if when.date() == now.date():
+        return "Today " + clock
+    if when.date() == now.date() - timedelta(days=1):
+        return "Yesterday " + clock
+    days = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    if age < 7 * 86400:
+        return "%s %s" % (days[when.weekday()], clock)
+    return "%02d %s %s" % (when.day, months[when.month - 1], clock)
+
+
+def display_lines(text):
+    """(bullet, text) per line: "- ", "* ", "• " become "•", "N. " keeps its
+    number. Display only: Copy and Paste use the raw stored text."""
+    out = []
+    for line in text.split("\n"):
+        for marker in ("- ", "* ", "• "):
+            if line.startswith(marker):
+                out.append(("•", line[len(marker):]))
+                break
+        else:
+            m = re.match(r"([0-9]+)\. ", line)
+            out.append((m.group(1) + ".", line[m.end():]) if m else (None, line))
+    return out
+
+
+RTL_RANGES = ((0x0590, 0x08FF), (0xFB1D, 0xFDFF), (0xFE70, 0xFEFF), (0x10800, 0x10FFF), (0x1E800, 0x1EFFF))
+
+
+def is_rtl(text):
+    """Right to left when the first strong (alphabetic) character is, like
+    CSS dir="auto"."""
+    for ch in text:
+        if ch.isalpha():
+            code = ord(ch)
+            return any(lo <= code <= hi for lo, hi in RTL_RANGES)
+    return False
+
+
+def encode_entry(stamp, text):
+    """Same shape as xhisper.sh's `jq -c` line: {"time":...,"text":...}."""
+    return json.dumps({"time": stamp, "text": text}, ensure_ascii=False, separators=(",", ":"))
+
+
+def update_history(entry, new_text, path=HISTORY_FILE, attempts=3):
+    """Replace one entry's text in place (matched on time and old text):
+    temp file created 0600, then renamed over the history. False on failure."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            original = f.read()
+    except OSError:
+        return False
+    lines = original.split("\n")
     for i in range(len(lines) - 1, -1, -1):
         try:
             item = json.loads(lines[i])
         except ValueError:
             continue
-        if item.get("time") == entry.get("time") and item.get("text") == entry.get("text"):
-            item["text"] = new_text
-            lines[i] = json.dumps(item, ensure_ascii=False) + "\n"
+        if isinstance(item, dict) and (str(item.get("time") or ""), item.get("text")) == entry:
+            lines[i] = encode_entry(entry[0], new_text)
             break
     else:
-        return
-    old_umask = os.umask(0o077)
+        return False
+    # Not xhisper.sh's "$HISTORY_FILE.tmp": both may write at once.
+    tmp = "%s.edit.%d" % (path, os.getpid())
     try:
-        with open(HISTORY_FILE + ".tmp", "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        os.replace(HISTORY_FILE + ".tmp", HISTORY_FILE)
-    finally:
-        os.umask(old_umask)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        os.chmod(tmp, 0o600)
+        # A dictation may have been appended meanwhile (the window stays open
+        # while one runs): start over rather than drop it.
+        with open(path, encoding="utf-8") as f:
+            if f.read() != original:
+                os.unlink(tmp)
+                return update_history(entry, new_text, path, attempts - 1) if attempts > 1 else False
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def arrival(shown, file):
+    """What a change of the history file does to the shown list: ("same",),
+    ("insert", count, keep) for new dictations on top (the oldest trimmed
+    off the end), or ("rebuild",) for anything else."""
+    if shown == file:
+        return ("same",)
+    if not shown or not file:
+        return ("rebuild",)
+    for k in range(len(file)):
+        keep = len(file) - k
+        if keep > len(shown):
+            continue
+        if file[k:] == shown[:keep] and not any(e in shown for e in file[:k]):
+            return ("insert", k, keep)
+    return ("rebuild",)
+
+
+def history_size():
+    try:
+        with open(os.path.join(CONFIG_DIR, "xhisperrc"), encoding="utf-8") as f:
+            for line in f:
+                name, sep, value = line.partition(":")
+                if sep and name.strip() == "history-size":
+                    return int(value.split(" #", 1)[0].strip().strip("'\""))
+    except (OSError, ValueError):
+        pass
+    return 20
+
+
+# ----- Helpers outside GTK ---------------------------------------------------
+
+def learn_from_edit(old, new):
+    """`xhisper-learn diff`, text over stdin; the words it learned."""
+    out = run([sibling("xhisper-learn"), "diff"], timeout=10,
+              data=json.dumps({"old": old, "new": new}).encode("utf-8"))
+    return out.split() if out else []
+
+
+def unlearn_words(words):
+    try:
+        return subprocess.run([sibling("xhisper-learn"), "remove", *words], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def clip_tool():
+    return shutil.which("wl-copy" if IS_WAYLAND else "xclip")
 
 
 def copy_text(text):
@@ -136,193 +479,1710 @@ def copy_text(text):
     clipboard.store()
 
 
+def read_clipboard():
+    """The clipboard's text, or None. Capped: an owner that never answers
+    (Chrome, 2026-10-14) must not hold up the paste."""
+    cmd = ["wl-paste", "--no-newline"] if IS_WAYLAND else ["xclip", "-o", "-selection", "clipboard"]
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=1)
+        return out.stdout.decode("utf-8") if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+
+
+TERMINAL_RE = re.compile(r"terminal|konsole|alacritty|kitty|wezterm|foot|xterm|tilix|terminator|yakuake|"
+                         r"urxvt|rxvt|ghostty|ptyxis|blackbox|terminology|guake|iterm|warp|hyper|"
+                         r"contour|tmux|st,st")
+
+
+def is_terminal_class(klass):
+    """Same rule as xhisper.sh's is_terminal_window: terminals take Ctrl+Shift+V."""
+    k = (klass or "").lower()
+    return k == "st" or bool(TERMINAL_RE.search(k))
+
+
+def app_name(klass):
+    """"gnome-terminal-server,Gnome-terminal" -> "Gnome Terminal", for the footer."""
+    words = [w for w in re.split(r"[-_.\s]+", (klass or "").split(",")[-1]) if w]
+    return " ".join(w[:1].upper() + w[1:] for w in words) or "the app"
+
+
+def pipeline_pid():
+    """The live dictation's pid (xhisper.pid "PID EPOCH"), None when none.
+    Same test as xhisper.sh's instance_alive, plus a wedge bound."""
+    try:
+        with open(PIPELINE_PID_FILE) as f:
+            parts = f.read().split()
+        pid = int(parts[0])
+        os.kill(pid, 0)
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"xhisper" not in f.read():
+                return None
+        if len(parts) > 1 and time.time() - float(parts[1]) > 1800:
+            return None
+        return pid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def paste_keystroke(terminal):
+    """Ctrl+V (Ctrl+Shift+V in terminals) through xhispertoold's uinput
+    keyboard, started if it is not running. True when it went out."""
+    tool = os.environ.get("XHISPERTOOL") or sibling("xhispertool")
+    cmd = [tool, "shift-paste" if terminal else "paste"]
+
+    def send():
+        try:
+            return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=2).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+    if send():
+        return True
+    log("paste: daemon not answering, starting xhispertoold")
+    try:
+        with open(os.path.join(RUNTIME_DIR, "xhispertoold.log"), "a") as err:
+            subprocess.Popen([sibling("xhispertoold")], stdin=subprocess.DEVNULL, stdout=err, stderr=err,
+                             start_new_session=True)
+    except OSError:
+        return False
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        time.sleep(0.15)
+        if send():
+            return True
+    return False
+
+
+# ----- Widgets -----------------------------------------------------------------
+
+def label(text, *classes, xalign=0.0):
+    w = Gtk.Label(label=text, xalign=xalign)
+    for c in classes:
+        w.get_style_context().add_class(c)
+    return w
+
+
+def icon(name, size):
+    image = Gtk.Image.new_from_icon_name(name, Gtk.IconSize.MENU)
+    image.set_pixel_size(size)
+    return image
+
+
+def bars_widget(heights, width, gap, radius, rgba, box_height):
+    """Rounded bars like the pill's: the header mark and the empty state."""
+    area = Gtk.DrawingArea()
+    area.set_size_request(int(round(len(heights) * width + (len(heights) - 1) * gap)), box_height)
+    area.set_valign(Gtk.Align.CENTER)
+
+    def draw(_w, cr):
+        cr.set_source_rgba(*rgba)
+        for i, h in enumerate(heights):
+            x, y = i * (width + gap), (box_height - h) / 2
+            r = min(radius, width / 2, h / 2)
+            cr.new_sub_path()
+            cr.arc(x + r, y + r, r, 3.14159265, 4.71238898)
+            cr.arc(x + width - r, y + r, r, -1.5707963, 0)
+            cr.arc(x + width - r, y + h - r, r, 0, 1.5707963)
+            cr.arc(x + r, y + h - r, r, 1.5707963, 3.14159265)
+            cr.close_path()
+        cr.fill()
+        return False
+    area.connect("draw", draw)
+    return area
+
+
+def ink_rgba(alpha):
+    return (237 / 255, 232 / 255, 217 / 255, alpha)
+
+
+class RowButton(Gtk.Button):
+    """A row action (A9 §5, §6): the 28 px icon button (Edit, Copy), the
+    primary capsule (Paste, or Copy without a paste target; Save) and the
+    ghost capsule (Cancel). Copy turns into "✓ Copied" for a moment."""
+
+    def __init__(self, kind, text=None, icon_name=None, tooltip=None):
+        super().__init__()
+        self.kind = kind
+        self.set_can_focus(False)
+        self.set_relief(Gtk.ReliefStyle.NONE)
+        self.get_style_context().add_class(kind)
+        if tooltip:
+            self.set_tooltip_text(tooltip)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               transition_duration=160, interpolate_size=True, hhomogeneous=False)
+        self.rest = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+        if icon_name:
+            self.rest.pack_start(icon(icon_name, 14), False, False, 0)
+            self.set_size_request(28, 28)
+        else:
+            self.rest.set_margin_start(12)
+            self.rest.set_margin_end(12)
+            self.rest.pack_start(label(text), False, False, 0)
+        self.glyph = label("↩", "glyph")
+        self.glyph.set_no_show_all(True)
+        self.rest.pack_start(self.glyph, False, False, 0)
+        copied = Gtk.Box(spacing=5)
+        copied.set_margin_start(9 if icon_name else 10)
+        copied.set_margin_end(11 if icon_name else 12)
+        copied.pack_start(icon("object-select-symbolic", 12), False, False, 0)
+        copied.pack_start(label("Copied"), False, False, 0)
+        self.stack.add_named(self.rest, "rest")
+        self.stack.add_named(copied, "copied")
+        self.add(self.stack)
+        self.inert = False
+
+    def set_return_glyph(self, on):
+        if self.kind == "icon":
+            return
+        self.glyph.set_visible(on)
+
+    def show_copied(self, shown=None):
+        """160 ms widen + crossfade into the check and "Copied", hold 1200,
+        200 ms back. Not clickable meanwhile."""
+        if self.inert:
+            if shown:
+                shown()
+            return
+        self.inert = True
+        if self.kind == "icon":
+            self.get_style_context().add_class("copied")
+        self.stack.set_transition_duration(160)
+        self.stack.set_visible_child_name("copied")
+
+        def back():
+            self.stack.set_transition_duration(200)
+            self.stack.set_visible_child_name("rest")
+            self.get_style_context().remove_class("copied")
+            GLib.timeout_add(200, lambda: setattr(self, "inert", False) or False)
+            return False
+        GLib.timeout_add(160, lambda: (shown() if shown else None) or False)
+        GLib.timeout_add(160 + 1200, back)
+
+
+class Row(Gtk.EventBox):
+    """One history entry (A9 §4, A5): radius 11, padding T6 R12 B12 L12; a
+    28 px meta line (time left, actions right), the text 2 below, "Show
+    more" below the text when it is clamped."""
+
+    def __init__(self, entry, index, controller):
+        super().__init__()
+        self.entry, self.index, self.c = entry, index, controller
+        self.set_visible_window(False)
+        self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("enter-notify-event", self.on_enter)
+        self.connect("leave-notify-event", self.on_leave)
+        self.hovered = self.is_target = self.expanded = self.editing = self.dimmed = False
+        self.lines = 1
+        self.measured_width = 0
+        self.highlight = None  # (words, alpha) while the learned words are lit
+        self.actions_alpha = 0.0
+        self.actions_tween = None
+        self.actions_shown = False
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.box.get_style_context().add_class("row")
+        self.add(self.box)
+        meta = Gtk.Box(spacing=4)
+        meta.set_size_request(-1, 28)
+        self.time = label("", "time")
+        self.time.set_ellipsize(Pango.EllipsizeMode.END)
+        self.time.set_valign(Gtk.Align.CENTER)
+        meta.pack_start(self.time, True, True, 0)
+        self.actions = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+        self.actions.set_opacity(0)
+        meta.pack_end(self.actions, False, False, 0)
+        self.box.pack_start(meta, False, False, 0)
+
+        self.text = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.text.set_ellipsize(Pango.EllipsizeMode.END)
+        self.text.get_style_context().add_class("entry")
+        self.text.set_margin_top(2)
+        self.text.set_can_focus(False)
+        self.text.connect("size-allocate", self.on_text_allocate)
+        # RTL (A9): the whole entry reads right to left. Measured: the label's
+        # xalign 1 right-aligns every wrapped line; flipping the widget's own
+        # direction as well flips Pango's alignment back to the left.
+        if is_rtl(entry[1]):
+            self.text.set_xalign(1.0)
+        self.box.pack_start(self.text, False, False, 0)
+
+        self.more = Gtk.Button()
+        self.more.set_can_focus(False)
+        self.more.set_relief(Gtk.ReliefStyle.NONE)
+        self.more.get_style_context().add_class("more")
+        self.more.set_halign(Gtk.Align.START)
+        more_box = Gtk.Box(spacing=3)
+        self.more_label = label("Show more")
+        self.more_icon = icon("pan-down-symbolic", 10)
+        more_box.pack_start(self.more_label, False, False, 0)
+        more_box.pack_start(self.more_icon, False, False, 0)
+        self.more.add(more_box)
+        self.more.connect("clicked", lambda *_: self.set_expanded(not self.expanded))
+        more_box.show_all()
+        self.more.set_no_show_all(True)
+        self.box.pack_start(self.more, False, False, 0)
+        self.watch_crossings(self.more)
+        self.watch_crossings(self.text)
+        self.field = None
+        self.refresh_time()
+        self.render_text()
+        self.show_all()
+
+    # The buttons, the selectable text and Show more have input windows of
+    # their own: going onto one sends the row a "leave" (and the actions faded
+    # out under the pointer, 2026-10-18). So every crossing just asks where
+    # the pointer really is.
+    def on_enter(self, *_):
+        GLib.idle_add(self.recheck_hover)
+
+    def on_leave(self, *_):
+        GLib.idle_add(self.recheck_hover)
+
+    def watch_crossings(self, widget):
+        widget.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        widget.connect("enter-notify-event", self.on_enter)
+        widget.connect("leave-notify-event", self.on_leave)
+
+    def pointer_inside(self):
+        window = self.get_window()  # the parent's window: the allocation is in it
+        if window is None or not self.get_mapped():
+            return False
+        pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
+        _win, x, y, _mask = window.get_device_position(pointer)
+        a = self.get_allocation()
+        return a.x <= x < a.x + a.width and a.y <= y < a.y + a.height
+
+    def recheck_hover(self):
+        inside = self.pointer_inside()
+        if inside != self.hovered:
+            self.hovered = inside
+            self.refresh(True)
+        return False
+
+    def set_actions(self, buttons):
+        for child in self.actions.get_children():
+            self.actions.remove(child)
+        for b in buttons:
+            self.actions.pack_start(b, False, False, 0)
+            if not getattr(b, "crossings_watched", False):
+                b.crossings_watched = True
+                self.watch_crossings(b)
+        self.actions.show_all()
+
+    def refresh_time(self):
+        """"2 min ago", or "2 min ago · Editing" while the editor is open."""
+        self.time.set_text(describe_time(self.entry[0]) + (" · Editing" if self.editing else ""))
+
+    def refresh(self, animated):
+        """Fill and actions: shown on hover, the Enter target and the row being edited."""
+        hover = self.hovered and self.c.editing is None and not self.dimmed
+        ctx = self.box.get_style_context()
+        for cls, on in (("hover", hover and not self.editing), ("target", self.is_target),
+                        ("editing", self.editing)):
+            if on:
+                ctx.add_class(cls)
+            else:
+                ctx.remove_class(cls)
+        if self.primary is not None:
+            self.primary.set_return_glyph(self.is_target and not self.editing)
+        show = self.is_target or self.editing or hover
+        if show == self.actions_shown:
+            return
+        self.actions_shown = show
+        if self.actions_tween:
+            self.actions_tween.stop()
+        start, end = self.actions_alpha, 1.0 if show else 0.0
+        if not animated:
+            self.set_actions_alpha(end)
+            return
+
+        def step(e):
+            self.set_actions_alpha(start + (end - start) * e)
+        self.actions_tween = Tween(0.12 if show else 0.08, CURVE_OUT if show else CURVE_IN, step)
+
+    primary = None
+    copy_button = None
+
+    def set_actions_alpha(self, a):
+        self.actions_alpha = a
+        self.actions.set_opacity(a)
+
+    def set_target(self, on):
+        self.is_target = on
+        self.refresh(True)
+        self.apply_clamp()
+
+    def set_expanded(self, on):
+        self.expanded = on
+        self.apply_clamp()
+
+    def markup(self):
+        esc = GLib.markup_escape_text
+        words, alpha = self.highlight or ([], 0)
+        pattern = None
+        if words and alpha > 0:
+            pattern = re.compile(r"(?<!\w)(%s)(?!\w)" % "|".join(re.escape(w) for w in words))
+        parts = []
+        for bullet, line in display_lines(self.entry[1]):
+            text = esc(line)
+            if pattern:
+                text = "".join(
+                    '<span background="#EDE8D9" bgalpha="%d%%">%s</span>' % (max(1, int(alpha * 16)), esc(p))
+                    if i % 2 else esc(p) for i, p in enumerate(pattern.split(line)))
+            if bullet:
+                text = '<span foreground="#CCC7BA" alpha="62%%">%s</span> %s' % (esc(bullet), text)
+            parts.append(text)
+        return "\n".join(parts)
+
+    def render_text(self):
+        self.text.set_markup(self.markup())
+        self.measured_width = 0  # re-measure
+
+    def on_text_allocate(self, _w, alloc):
+        if alloc.width != self.measured_width and alloc.width > 1:
+            self.measured_width = alloc.width
+            layout = self.text.create_pango_layout(None)
+            layout.set_markup(self.markup(), -1)
+            layout.set_width(alloc.width * Pango.SCALE)
+            layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+            lines = layout.get_line_count()
+            if lines != self.lines:
+                self.lines = lines
+                GLib.idle_add(lambda: self.apply_clamp() or False)
+
+    def apply_clamp(self):
+        """3 lines (6 on the Enter target) with "Show more"; expanded shows all."""
+        if self.editing:
+            return
+        clamp = 6 if self.is_target else 3
+        truncatable = self.lines > clamp
+        self.text.set_lines(-1 if (self.expanded and truncatable) else clamp)
+        self.text.set_ellipsize(Pango.EllipsizeMode.NONE if (self.expanded and truncatable)
+                                else Pango.EllipsizeMode.END)
+        self.more_label.set_text("Show less" if self.expanded else "Show more")
+        self.more_icon.set_from_icon_name("pan-up-symbolic" if self.expanded else "pan-down-symbolic",
+                                          Gtk.IconSize.MENU)
+        self.more.set_visible(truncatable)
+
+    def set_dimmed(self, on):
+        """Another row is edited (A5): whole row at 40 %, no hover, no clicks."""
+        if on == self.dimmed:
+            return
+        self.dimmed = on
+        self.set_above_child(on)  # the event box swallows every click
+        start = self.get_opacity()
+        end = 0.4 if on else 1.0
+        Tween(0.18 if on else 0.15, CURVE_STD, lambda e: self.set_opacity(start + (end - start) * e))
+        self.refresh(True)
+
+    def enter_edit(self, field, buttons):
+        self.editing = True
+        self.field = field
+        self.refresh_time()
+        self.rest_actions = self.actions.get_children()
+        self.set_actions(buttons)
+        self.text.hide()
+        self.more.hide()
+        field.set_margin_top(2)
+        self.box.pack_start(field, False, False, 0)
+        field.show_all()
+        self.refresh(True)
+
+    def leave_edit(self, saved_text=None):
+        if not self.editing:
+            return
+        if saved_text is not None:
+            self.entry = (self.entry[0], saved_text)
+        self.editing = False
+        if self.field is not None:
+            self.box.remove(self.field)
+            self.field = None
+        self.set_actions(self.rest_actions)
+        self.refresh_time()
+        self.text.show()
+        self.render_text()
+        self.lines = 1
+        self.apply_clamp()
+        self.refresh(True)
+
+    def flash(self):
+        """A7 new entry: an ink 0.10 fill that fades out over 900 ms."""
+        ctx = self.box.get_style_context()
+        ctx.add_class("flash")
+
+        def fade():
+            ctx.remove_class("flash")
+            ctx.add_class("flash-out")
+            GLib.timeout_add(950, lambda: ctx.remove_class("flash-out") or False)
+            return False
+        GLib.timeout_add(60, fade)
+
+    def highlight_words(self, words):
+        """A4: the learned words lit for 1500 ms, then faded out over 600 ms."""
+        self.highlight = (words, 1.0)
+        self.render_text()
+
+        def fade(e):
+            self.highlight = (words, 1 - e) if e < 1 else None
+            self.render_text()
+        Tween(0.6, CURVE_STD, fade, delay=1.5)
+
+
+class EditField(Gtk.Box):
+    """The edit field (A3): 13 px text on black 0.28, 1 px border, radius 8,
+    padding 7 x 9; grows with its text from 2 to 10 lines, then scrolls."""
+
+    def __init__(self, text):
+        super().__init__()
+        self.get_style_context().add_class("field")
+        self.view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, accepts_tab=False)
+        self.view.set_left_margin(9)
+        self.view.set_right_margin(9)
+        self.view.set_top_margin(7)
+        self.view.set_bottom_margin(7)
+        self.view.set_pixels_inside_wrap(1)
+        self.view.get_buffer().set_text(text)
+        if is_rtl(text):
+            self.view.set_direction(Gtk.TextDirection.RTL)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_min_content_height(2 * LINE_HEIGHT + 14)
+        scroll.set_max_content_height(10 * LINE_HEIGHT + 14)
+        scroll.add(self.view)
+        self.pack_start(scroll, True, True, 0)
+        buf = self.view.get_buffer()
+        buf.place_cursor(buf.get_end_iter())
+
+    @property
+    def text(self):
+        buf = self.view.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def set_failed(self, on):
+        ctx = self.get_style_context()
+        if on:
+            ctx.add_class("failed")
+        else:
+            ctx.remove_class("failed")
+
+
 class HistoryWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app)
+        super().__init__(application=app, type=Gtk.WindowType.TOPLEVEL)
+        self.app = app
         self.set_name("xhisper-history")
-        self.set_default_size(560, 520)
+        self.set_title("History")
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_app_paintable(True)
+        visual = self.get_screen().get_rgba_visual()
+        self.composited = visual is not None and self.get_screen().is_composited()
+        if visual is not None:
+            self.set_visual(visual)
+        self.reduce = reduce_motion()
+        self.margin = SHADOW if self.composited else 0
 
-        self.header = Gtk.HeaderBar(title="Dictation history", show_close_button=True)
-        self.set_titlebar(self.header)
-        self.editing = None  # (entry, row parts) while a dictation is being edited
-        self.stale = False   # the file changed during an edit: reload after it
+        self.entries = []
+        self.rows = []
+        self.editing = None        # (entry, field, row) while an entry is edited
+        self.stale = False         # the file changed during an edit: apply after it
+        self.actions_stale = False  # the paste target changed during an edit
+        self.target_index = 0      # the row ↩ acts on
+        self.closing = False
+        self.pasting = False
+        self.closing_after_copy = False
+        self.copy_close = None
+        self.ever_focused = False
+        self.awaiting_focus = False  # shown during a dictation: no keys until it pasted
+        self.pipeline = None
+        self.motion = None
+        self.toast = None
+        self.toast_kind = None
+        self.toast_hold = None
+        self.toast_deadline = 0
+        self.toast_remaining = 0
+        self.new_count = 0
+        self.new_chip_shown = False
+        self.target = None         # the window Paste goes to (dict), None hides Paste
+        self.return_window = None  # the window to hand the keys back to on close
+        self.drag = None
 
-        self.list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.list_box.set_margin_start(12)
-        self.list_box.set_margin_end(12)
-        self.list_box.set_margin_top(4)
-        self.list_box.set_margin_bottom(12)
-        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroller.add(self.list_box)
-        self.add(scroller)
-
+        self.connect("draw", self.on_draw)
         self.connect("key-press-event", self.on_key)
+        self.connect("focus-in-event", self.on_focus_in)
+        self.connect("focus-out-event", self.on_focus_out)
+        self.connect("delete-event", lambda *_: self.close_animated() or True)
+        self.connect("size-allocate", self.on_size_allocate)
+        self.connect("configure-event", self.on_configure)
+        self.resizing = False
+        self.save_source = None
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.connect("button-press-event", self.on_edge_press)
+        self.connect("motion-notify-event", self.on_edge_motion)
+
+        self.build()
         self.populate()
 
-        # Refresh live when a new dictation lands while the window is open.
         self.monitor = Gio.File.new_for_path(HISTORY_FILE).monitor_file(Gio.FileMonitorFlags.NONE, None)
         self.monitor.connect("changed", self.on_file_changed)
+        self.refresh_pending = False
+        GLib.timeout_add(250, self.watch_pipeline)
+        GLib.timeout_add_seconds(30, self.refresh_times)
 
-    def populate(self):
-        if self.editing:
-            self.stale = True  # don't wipe an edit in progress
+    # ----- building ------------------------------------------------------------
+
+    def build(self):
+        overlay = Gtk.Overlay()
+        overlay.set_margin_start(self.margin)
+        overlay.set_margin_end(self.margin)
+        overlay.set_margin_top(self.margin)
+        overlay.set_margin_bottom(self.margin)
+        self.add(overlay)
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        overlay.add(main)
+
+        # Header (44): mark, title, close. It is the window's drag area.
+        header = Gtk.EventBox()
+        header.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        header.connect("button-press-event", self.on_header_press)
+        header.connect("motion-notify-event", self.on_edge_motion)
+        hbox = Gtk.Box()
+        hbox.set_size_request(-1, 44)
+        mark = bars_widget([5, 9, 14, 8, 11], 2, 1.5, 1, ink_rgba(1), 14)
+        mark.set_margin_start(16)
+        hbox.pack_start(mark, False, False, 0)
+        title = label("History", "title")
+        title.set_margin_start(7)
+        hbox.pack_start(title, False, False, 0)
+        close = Gtk.Button()
+        close.set_can_focus(False)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        close.get_style_context().add_class("close")
+        close.set_tooltip_text("Close (esc)")
+        close.add(icon("window-close-symbolic", 10))
+        close.set_valign(Gtk.Align.CENTER)
+        close.set_margin_end(10 - 2)
+        close.connect("clicked", lambda *_: self.close_animated())
+        hbox.pack_end(close, False, False, 0)
+        header.add(hbox)
+        main.pack_start(header, False, False, 0)
+        self.header_sep = Gtk.Box()
+        self.header_sep.get_style_context().add_class("sep")
+        self.header_sep.set_opacity(0)
+        main.pack_start(self.header_sep, False, False, 0)
+        self.header_scrolled = False
+
+        self.stack = Gtk.Stack()
+        self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.scroll.set_overlay_scrolling(True)
+        self.scroll.set_margin_start(GRAB)
+        self.scroll.set_margin_end(GRAB)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.list.set_margin_start(8 - GRAB)
+        self.list.set_margin_end(8 - GRAB)
+        self.list.set_margin_bottom(8)
+        self.list.set_valign(Gtk.Align.START)
+        self.scroll.add(self.list)
+        self.vadj = self.scroll.get_vadjustment()
+        self.vadj.connect("value-changed", self.on_scrolled)
+        self.stack.add_named(self.scroll, "list")
+        self.stack.add_named(self.make_empty(), "empty")
+        main.pack_start(self.stack, True, True, 0)
+
+        # Footer (32): keycap hints, one right-aligned.
+        sep = Gtk.Box()
+        sep.get_style_context().add_class("sep")
+        main.pack_start(sep, False, False, 0)
+        footer = Gtk.EventBox()
+        footer.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        footer.connect("button-press-event", self.on_footer_press)
+        footer.connect("motion-notify-event", self.on_edge_motion)
+        fbox = Gtk.Box()
+        fbox.set_size_request(-1, 31)
+        self.hints = Gtk.Box(spacing=16)
+        self.hints.set_margin_start(16)
+        self.trailing_hint = Gtk.Box(spacing=16)
+        self.trailing_hint.set_margin_end(16)
+        fbox.pack_start(self.hints, False, False, 0)
+        fbox.pack_end(self.trailing_hint, False, False, 0)
+        footer.add(fbox)
+        main.pack_start(footer, False, False, 0)
+
+        # The "N new" chip, under the header.
+        self.new_chip = Gtk.Button()
+        self.new_chip.set_can_focus(False)
+        self.new_chip.get_style_context().add_class("newchip")
+        chip_box = Gtk.Box(spacing=4)
+        chip_box.pack_start(icon("go-up-symbolic", 10), False, False, 0)
+        self.new_chip_label = label("")
+        chip_box.pack_start(self.new_chip_label, False, False, 0)
+        self.new_chip.add(chip_box)
+        self.new_chip.set_tooltip_text("Scroll to the newest")
+        self.new_chip.set_halign(Gtk.Align.CENTER)
+        self.new_chip.set_valign(Gtk.Align.START)
+        self.new_chip.set_margin_top(44 + 8)
+        self.new_chip.connect("clicked", lambda *_: self.scroll_to_top())
+        self.new_chip.set_no_show_all(True)
+        overlay.add_overlay(self.new_chip)
+
+        # Toasts, 12 above the footer.
+        self.toast_slot = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.END)
+        self.toast_slot.set_margin_bottom(32 + 12)
+        overlay.add_overlay(self.toast_slot)
+        overlay.set_overlay_pass_through(self.toast_slot, False)
+
+    def make_empty(self):
+        """A6: seven bars, title, one line of help; centred, raised 22."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        box.set_margin_bottom(44)
+        bars = bars_widget([6, 10, 15, 20, 15, 10, 6], 4, 3, 2, ink_rgba(0.35), 28)
+        bars.set_halign(Gtk.Align.CENTER)
+        bars.set_margin_bottom(8)
+        box.pack_start(bars, False, False, 0)
+        box.pack_start(label("No dictations yet", "empty-title", xalign=0.5), False, False, 0)
+        body = label("Hold your dictation hotkey and speak. Your last %d dictations will show up here."
+                     % history_size(), "empty-body", xalign=0.5)
+        body.set_justify(Gtk.Justification.CENTER)
+        body.set_line_wrap(True)
+        body.set_max_width_chars(38)
+        box.pack_start(body, False, False, 0)
+        return box
+
+    # ----- drawing, shape, resize ----------------------------------------------
+
+    def set_opacity(self, value):
+        Gtk.Widget.set_opacity(self, value)  # Gtk.Window's own is deprecated
+
+    def get_opacity(self):
+        return Gtk.Widget.get_opacity(self)
+
+    def card_rect(self):
+        alloc = self.get_allocation()
+        return (self.margin, self.margin, alloc.width - 2 * self.margin, alloc.height - 2 * self.margin)
+
+    def on_draw(self, _w, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        x, y, w, h = self.card_rect()
+        r = RADIUS if self.composited else 0
+        if self.composited:
+            # The window's shadow (0 12 32 black 0.45 on macOS), as stacked outlines.
+            steps = 16
+            for k in range(steps):
+                spread = SHADOW * (1 - k / steps)
+                self.rounded(cr, x - spread / 2, y + 8 - spread / 2, w + spread, h + spread, r + spread / 2)
+                cr.set_source_rgba(0, 0, 0, 0.45 / steps * 1.4)
+                cr.fill()
+        self.rounded(cr, x, y, w, h, r)
+        cr.set_source_rgba(*SURFACE)
+        cr.fill()
+        self.rounded(cr, x + 0.5, y + 0.5, w - 1, h - 1, max(0, r - 0.5))
+        cr.set_source_rgba(*EDGE)
+        cr.set_line_width(1)
+        cr.stroke()
+        return False
+
+    @staticmethod
+    def rounded(cr, x, y, w, h, r):
+        r = max(0, min(r, w / 2, h / 2))
+        cr.new_path()
+        if r == 0:
+            cr.rectangle(x, y, w, h)
             return
-        for child in self.list_box.get_children():
-            self.list_box.remove(child)
-        entries = load_entries()
-        self.first_button = None
-        if not entries:
-            empty = Gtk.Label(label="No dictations yet")
-            empty.get_style_context().add_class("empty")
-            empty.set_vexpand(True)
-            self.list_box.pack_start(empty, True, True, 0)
-        for entry in entries:
-            self.list_box.pack_start(self.make_row(entry), False, False, 0)
-        self.list_box.show_all()
+        cr.arc(x + r, y + r, r, 3.14159265, 4.71238898)
+        cr.arc(x + w - r, y + r, r, -1.5707963, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, 1.5707963)
+        cr.arc(x + r, y + h - r, r, 1.5707963, 3.14159265)
+        cr.close_path()
 
-    def make_row(self, entry):
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        row.get_style_context().add_class("entry")
-
-        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        when = Gtk.Label(label=describe_time(entry.get("time")), xalign=0)
-        when.get_style_context().add_class("when")
-        body = Gtk.Label(label=entry["text"], xalign=0, wrap=True, selectable=True)
-        body.set_line_wrap_mode(2)  # Pango.WrapMode.WORD_CHAR
-        body.set_max_width_chars(60)
-        body.get_style_context().add_class("text")
-        texts.pack_start(when, False, False, 0)
-        texts.pack_start(body, False, False, 0)
-        row.pack_start(texts, True, True, 0)
-
-        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, valign=Gtk.Align.CENTER)
-        button = Gtk.Button(label="Copy")
-        button.get_style_context().add_class("copy")
-        button.connect("clicked", self.on_copy, entry["text"])
-        edit = Gtk.Button(label="Edit", tooltip_text="Fix this dictation; corrected words are learned")
-        edit.get_style_context().add_class("copy")
-        edit.connect("clicked", self.on_edit, entry, texts, body, buttons)
-        buttons.pack_start(button, False, False, 0)
-        buttons.pack_start(edit, False, False, 0)
-        if self.first_button is None:
-            self.first_button = button
-        row.pack_end(buttons, False, False, 0)
-        return row
-
-    def on_edit(self, _button, entry, texts, body, buttons):
-        if self.editing:
+    def on_size_allocate(self, _w, _alloc):
+        """Clicks on the shadow go through to the windows below."""
+        window = self.get_window()
+        if window is None or not self.margin:
             return
-        view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
-        view.get_buffer().set_text(entry["text"])
-        view.get_style_context().add_class("editor")
-        save = Gtk.Button(label="Save")
-        save.get_style_context().add_class("copy")
-        save.get_style_context().add_class("suggested-action")
-        cancel = Gtk.Button(label="Cancel")
-        cancel.get_style_context().add_class("copy")
-        old_buttons = buttons.get_children()
-        for child in old_buttons:
-            buttons.remove(child)
-        buttons.pack_start(save, False, False, 0)
-        buttons.pack_start(cancel, False, False, 0)
-        texts.remove(body)
-        texts.pack_start(view, False, False, 0)
-        self.editing = (entry, view)
-        save.connect("clicked", lambda *_: self.finish_edit(save=True))
-        cancel.connect("clicked", lambda *_: self.finish_edit(save=False))
-        texts.show_all()
-        buttons.show_all()
-        view.grab_focus()
+        x, y, w, h = self.card_rect()
+        if getattr(self, "_shape", None) == (w, h):
+            return
+        self._shape = (w, h)
+        self.input_shape_combine_region(cairo.Region(cairo.RectangleInt(x, y, w, h)))
 
-    def finish_edit(self, save):
-        entry, view = self.editing
-        self.editing = None
-        buf = view.get_buffer()
-        new_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
-        if save and new_text and new_text != entry["text"]:
-            learned = learn_from_edit(entry["text"], new_text)
-            update_history(entry, new_text)
-            self.show_status("Learned: " + ", ".join(learned) if learned else "Saved")
-        self.stale = False
-        self.populate()
+    def on_configure(self, *_):
+        """A resize ended: keep the size (only the size: the position is
+        recomputed on every open)."""
+        if self.resizing:
+            if self.save_source:
+                GLib.source_remove(self.save_source)
+            self.save_source = GLib.timeout_add(400, self.resize_settled)
+        return False
 
-    def show_status(self, text):
-        self.header.set_subtitle(text)
-        GLib.timeout_add(3500, lambda: self.header.set_subtitle(None) or False)
+    def resize_settled(self):
+        self.save_source = None
+        self.resizing = False
+        self.save_size()
+        return False
 
-    def on_copy(self, button, text):
-        copy_text(text)
-        button.set_label("Copied")
-        GLib.timeout_add(1200, lambda: button.set_label("Copy") or False)
+    def edge_at(self, wx, wy):
+        """The resize edge under a window point (6 px bands inside the card,
+        corners 19 long), as a Gdk.WindowEdge, or None."""
+        x, y, w, h = self.card_rect()
+        px, py = wx - x, wy - y
+        if px < 0 or py < 0 or px > w or py > h:
+            return None
+        left, right, top, bottom = px < GRAB, px > w - GRAB, py < GRAB, py > h - GRAB
+        if left or right:
+            if py < CORNER_SPAN:
+                top = True
+            elif py > h - CORNER_SPAN:
+                bottom = True
+        if top or bottom:
+            if px < CORNER_SPAN:
+                left = True
+            elif px > w - CORNER_SPAN:
+                right = True
+        E = Gdk.WindowEdge
+        table = {(True, False, True, False): E.NORTH_WEST, (False, True, True, False): E.NORTH_EAST,
+                 (True, False, False, True): E.SOUTH_WEST, (False, True, False, True): E.SOUTH_EAST,
+                 (True, False, False, False): E.WEST, (False, True, False, False): E.EAST,
+                 (False, False, True, False): E.NORTH, (False, False, False, True): E.SOUTH}
+        return table.get((left, right, top, bottom))
 
-    def on_file_changed(self, _monitor, _file, _other, event):
-        if event in (Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
-                     Gio.FileMonitorEvent.DELETED):
-            self.populate()
+    CURSORS = {"NORTH_WEST": "nw-resize", "NORTH_EAST": "ne-resize", "SOUTH_WEST": "sw-resize",
+               "SOUTH_EAST": "se-resize", "WEST": "w-resize", "EAST": "e-resize",
+               "NORTH": "n-resize", "SOUTH": "s-resize"}
 
-    def on_key(self, _widget, event):
-        if event.keyval == Gdk.KEY_Escape:
-            if self.editing:
-                self.finish_edit(save=False)
-            else:
-                self.close()
+    def window_point(self, _widget, event):
+        """The event in window coordinates (it may come from a child's own GdkWindow)."""
+        window = self.get_window()
+        if window is None:
+            return event.x, event.y
+        _ok, ox, oy = window.get_origin()
+        return event.x_root - ox, event.y_root - oy
+
+    def on_edge_motion(self, widget, event):
+        wx, wy = self.window_point(widget, event)
+        edge = self.edge_at(wx, wy)
+        name = self.CURSORS.get(edge.value_nick.upper().replace("-", "_")) if edge is not None else None
+        gdk_window = self.get_window()
+        if gdk_window is not None and name != getattr(self, "_cursor", None):
+            self._cursor = name
+            gdk_window.set_cursor(Gdk.Cursor.new_from_name(self.get_display(), name) if name else None)
+        return False
+
+    def try_resize(self, widget, event):
+        if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        edge = self.edge_at(*self.window_point(widget, event))
+        if edge is None:
+            return False
+        self.resizing = True
+        self.begin_resize_drag(edge, event.button, int(event.x_root), int(event.y_root), event.time)
+        return True
+
+    def on_edge_press(self, widget, event):
+        return self.try_resize(widget, event)
+
+    def on_header_press(self, widget, event):
+        if self.try_resize(widget, event):
+            return True
+        if event.button == 1 and event.type == Gdk.EventType.BUTTON_PRESS:
+            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
             return True
         return False
 
-    def widget_set_opacity(self, value):
-        Gtk.Widget.set_opacity(self, value)
+    def on_footer_press(self, widget, event):
+        return self.try_resize(widget, event)
+
+    # ----- list ------------------------------------------------------------------
+
+    def populate(self):
+        """The whole list from the file, the Enter target on the newest."""
+        self.rebuild(load_entries(), keep_place=False)
+
+    def rebuild(self, entries, keep_place):
+        if self.editing:
+            self.stale = True  # don't wipe an edit in progress
+            return
+        self.cancel_copy_close()
+        y = self.vadj.get_value()
+        moved = self.entries[self.target_index] if (keep_place and 0 < self.target_index < len(self.entries)) else None
+        expanded = {r.entry for r in self.rows if r.expanded} if keep_place else set()
+        for child in self.list.get_children():
+            self.list.remove(child)
+        self.entries = entries
+        self.target_index = entries.index(moved) if moved in entries else 0
+        self.rows = []
+        for i, entry in enumerate(entries):
+            row = self.make_row(entry, i)
+            if entry in expanded:
+                row.expanded = True
+            self.rows.append(row)
+            self.list.pack_start(row, False, False, 0)
+        self.stack.set_visible_child_name("list" if entries else "empty")
+        if keep_place and entries:
+            GLib.idle_add(lambda: self.vadj.set_value(y) or False)
+        else:
+            self.hide_new_chip()
+        self.update_footer()
+
+    def make_row(self, entry, index):
+        """Actions Edit · Copy · Paste, the primary capsule last: Paste when a
+        text field waits for it, else Copy."""
+        row = Row(entry, index, self)
+        edit = RowButton("icon", icon_name="document-edit-symbolic", tooltip="Edit")
+        edit.connect("clicked", lambda *_: self.edit_entry(row))
+        if self.target is not None:
+            copy = RowButton("icon", icon_name="edit-copy-symbolic", tooltip="Copy")
+            paste = RowButton("primary", "Paste", tooltip="Paste into %s" % app_name(self.target["class"]))
+            paste.connect("clicked", lambda *_: self.paste_entry(row.index))
+            row.set_actions([edit, copy, paste])
+            row.primary = paste
+        else:
+            copy = RowButton("primary", "Copy", tooltip="Copy")
+            row.set_actions([edit, copy])
+            row.primary = copy
+        copy.connect("clicked", lambda *_: self.copy_entry(row.index))
+        row.copy_button = copy
+        row.is_target = index == self.target_index
+        row.refresh(False)
+        row.apply_clamp()
+        return row
+
+    def refresh_actions(self):
+        """The paste target changed (a raise): rebuild the rows' buttons."""
+        self.rebuild(self.entries, keep_place=True)
+
+    def refresh_times(self):
+        for row in self.rows:
+            row.refresh_time()
+        return True
+
+    def update_footer(self):
+        """What ↩ does, and esc; the editor's keys while editing."""
+        if self.editing:
+            self.set_hints([("↩", "Save"), ("⇧↩", "New line")], ("esc", "Cancel"))
+            return
+        hints = []
+        if self.entries:
+            which = "newest " if self.target_index == 0 else ""
+            if self.target is not None:
+                hints.append(("↩", "Paste %sin %s" % (which, app_name(self.target["class"]))))
+            else:
+                hints.append(("↩", "Copy newest" if self.target_index == 0 else "Copy"))
+        self.set_hints(hints, ("esc", "Close"))
+
+    def set_hints(self, hints, trailing):
+        for box in (self.hints, self.trailing_hint):
+            for child in box.get_children():
+                box.remove(child)
+        for key, text in hints:
+            self.hints.pack_start(self.hint(key, text), False, False, 0)
+        if trailing:
+            self.trailing_hint.pack_start(self.hint(*trailing), False, False, 0)
+        self.hints.show_all()
+        self.trailing_hint.show_all()
+
+    @staticmethod
+    def hint(key, text):
+        box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        cap = label(key, "keycap", xalign=0.5)
+        cap.set_valign(Gtk.Align.CENTER)
+        box.pack_start(cap, False, False, 0)
+        hint = label(text, "hint")
+        hint.set_ellipsize(Pango.EllipsizeMode.END)
+        box.pack_start(hint, False, False, 0)
+        return box
+
+    def on_scrolled(self, adj):
+        scrolled = adj.get_value() > 0.5
+        if scrolled != self.header_scrolled:
+            self.header_scrolled = scrolled
+            start, end = self.header_sep.get_opacity(), 1.0 if scrolled else 0.0
+            Tween(0.12, Curve(0, 0, 1, 1), lambda e: self.header_sep.set_opacity(start + (end - start) * e))
+        if not scrolled:
+            self.hide_new_chip()
+
+    # ----- live arrival (A7) --------------------------------------------------
+
+    def on_file_changed(self, _monitor, _file, _other, event):
+        if event not in (Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
+                         Gio.FileMonitorEvent.DELETED, Gio.FileMonitorEvent.RENAMED,
+                         Gio.FileMonitorEvent.MOVED_IN):
+            return
+        if not self.refresh_pending:
+            self.refresh_pending = True
+            GLib.timeout_add(120, self.refresh_from_file)
+
+    def refresh_from_file(self):
+        self.refresh_pending = False
+        if self.editing:
+            self.stale = True
+            return False
+        self.stale = False
+        file = load_entries()
+        change = arrival(self.entries, file)
+        if change[0] == "rebuild":
+            self.rebuild(file, keep_place=True)
+        elif change[0] == "insert":
+            self.insert_arrivals(file, change[1], change[2])
+        return False
+
+    def insert_arrivals(self, file, count, keep):
+        """`count` new rows on top, old rows past `keep` dropped. At the top
+        of the list they slide open; scrolled down, the visible rows stay put
+        and the "N new" chip counts them."""
+        scrolled = self.vadj.get_value() > 0.5
+        for row in self.rows[keep:]:
+            self.list.remove(row.get_parent() if isinstance(row.get_parent(), Gtk.Revealer) else row)
+        old = self.rows[:keep]
+        for row in old:
+            row.index += count
+        moved = 0 < self.target_index < keep
+        self.target_index = self.target_index + count if moved else 0
+        self.entries = file
+        before = self.list.get_allocated_height()
+        added = []
+        for i, entry in enumerate(file[:count]):
+            row = self.make_row(entry, i)
+            revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+                                    transition_duration=0 if (scrolled or self.reduce) else 220)
+            revealer.add(row)
+            self.list.pack_start(revealer, False, False, 0)
+            self.list.reorder_child(revealer, i)
+            revealer.show_all()
+            added.append((row, revealer))
+        self.rows = [r for r, _ in added] + old
+        for row in old:
+            if row.is_target != (row.index == self.target_index):
+                row.set_target(row.index == self.target_index)
+        for row, revealer in added:
+            revealer.set_reveal_child(True)
+            row.flash()
+        if scrolled:
+            # Keep the visible rows where they were: move the view by what grew above them.
+            def keep_view(*_):
+                grown = self.list.get_allocated_height() - before
+                if grown > 0:
+                    self.vadj.set_value(self.vadj.get_value() + grown)
+                self.list.disconnect(handler)
+            handler = self.list.connect("size-allocate", keep_view)
+            self.new_count += count
+            self.show_new_chip()
+        self.update_footer()
+
+    def show_new_chip(self):
+        self.new_chip_label.set_text("%d new" % self.new_count)
+        if self.new_chip_shown:
+            return
+        self.new_chip_shown = True
+        self.new_chip.show_all()
+        rise = 0 if self.reduce else 4
+
+        def step(e):
+            self.new_chip.set_opacity(e)
+            self.new_chip.set_margin_top(int(44 + 8 - rise * (1 - e)))
+        Tween(0.16, CURVE_OUT, step)
+
+    def hide_new_chip(self):
+        self.new_count = 0
+        if not self.new_chip_shown:
+            return
+        self.new_chip_shown = False
+        alpha = self.new_chip.get_opacity()
+
+        def done():
+            if not self.new_chip_shown:
+                self.new_chip.hide()
+        Tween(0.16, CURVE_IN, lambda e: self.new_chip.set_opacity(alpha * (1 - e)), done)
+
+    def scroll_to_top(self):
+        start = self.vadj.get_value()
+        self.hide_new_chip()
+        Tween(0.2, CURVE_STD, lambda e: self.vadj.set_value(start * (1 - e)))
+
+    def reveal(self, row):
+        """Keep a row in view (4 px of the gap around it too)."""
+        alloc = row.get_allocation()
+        parent = row.get_parent()
+        if isinstance(parent, Gtk.Revealer):
+            alloc = parent.get_allocation()
+        top, bottom = alloc.y - 4, alloc.y + alloc.height + 4
+        value, page = self.vadj.get_value(), self.vadj.get_page_size()
+        if top < value:
+            self.vadj.set_value(max(0, top))
+        elif bottom > value + page:
+            self.vadj.set_value(bottom - page)
+
+    # ----- keyboard (A9 §8) -----------------------------------------------------
+
+    def on_key(self, _w, event):
+        key = event.keyval
+        mods = event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+                              | Gdk.ModifierType.MOD1_MASK | Gdk.ModifierType.SUPER_MASK)
+        if mods == Gdk.ModifierType.CONTROL_MASK and key in (Gdk.KEY_w, Gdk.KEY_W):
+            self.close_animated()
+            return True
+        if self.editing:
+            if key == Gdk.KEY_Escape:  # also when the field lost the focus
+                self.finish_edit(False)
+                return True
+            return False  # the field has its own keys
+        if mods:
+            return False
+        if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
+            self.activate_target()
+            return True
+        if key == Gdk.KEY_Escape:
+            self.close_animated()
+            return True
+        if key in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+            self.move_target(-1)
+            return True
+        if key in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+            self.move_target(1)
+            return True
+        return False
+
+    def activate_target(self):
+        """↩: Paste the target row; with nowhere to paste, Copy it and close
+        500 ms after the check appears."""
+        if self.closing or self.closing_after_copy or not (0 <= self.target_index < len(self.entries)):
+            return
+        if self.target is not None:
+            self.paste_entry(self.target_index)
+            return
+        self.closing_after_copy = True
+
+        def shown():
+            if self.closing_after_copy:
+                self.copy_close = GLib.timeout_add(500, self.copy_close_fire)
+        self.copy_entry(self.target_index, shown)
+
+    def copy_close_fire(self):
+        self.copy_close = None
+        self.close_animated()
+        return False
+
+    def cancel_copy_close(self):
+        if self.copy_close:
+            GLib.source_remove(self.copy_close)
+            self.copy_close = None
+        self.closing_after_copy = False
+
+    def move_target(self, delta):
+        if self.closing or not self.rows:
+            return
+        new = max(0, min(len(self.rows) - 1, self.target_index + delta))
+        if new == self.target_index:
+            return
+        self.rows[self.target_index].set_target(False)
+        self.target_index = new
+        row = self.rows[new]
+        row.set_target(True)
+        GLib.idle_add(lambda: self.reveal(row) or False)
+        GLib.timeout_add(60, lambda: self.reveal(row) or False)
+        self.update_footer()
+
+    # ----- copy, paste, edit ------------------------------------------------------
+
+    def copy_entry(self, index, shown=None):
+        if self.editing or self.closing or not (0 <= index < len(self.entries)):
+            return
+        copy_text(self.entries[index][1])
+        button = self.rows[index].copy_button if index < len(self.rows) else None
+        if button is not None:
+            button.show_copied(shown)
+        elif shown:
+            shown()
+
+    def paste_entry(self, index):
+        """Paste (A9 §7): clipboard = the raw text, the window fades out in
+        120 ms and hides, the target window gets the keys back, Ctrl+V goes
+        to it, the old clipboard comes back 0.3 s later, then we quit."""
+        log("paste clicked: row %d of %d, editing %s, closing %s, target %s"
+            % (index, len(self.entries), self.editing is not None, self.closing,
+               self.target["class"] if self.target else "none"))
+        if self.editing or self.closing or self.target is None or not (0 <= index < len(self.entries)):
+            return
+        target = self.target
+        text = self.entries[index][1]
+        self.closing = self.pasting = True
+        # Hiding the last window must not end the app before the keystroke.
+        self.app.hold()
+        if self.motion:
+            self.motion.stop()
+        alpha = self.get_opacity()
+        start = time.monotonic()
+
+        def faded():
+            self.hide()
+            wait = max(0.16 - (time.monotonic() - start), 0.04)
+            GLib.timeout_add(int(wait * 1000), lambda: self.start_paste_thread(target, text) or False)
+        self.motion = Tween(0.12, CURVE_IN, lambda e: self.set_opacity(alpha * (1 - e)), faded)
+
+    def start_paste_thread(self, target, text):
+        threading.Thread(target=self.send_paste, args=(target, text), daemon=True).start()
+
+    def send_paste(self, target, text):
+        # Runs on a worker thread: the clipboard must go through a CLI tool,
+        # never copy_text()'s GTK fallback.
+        if not clip_tool():
+            log("paste: no xclip / wl-copy, cannot paste")
+            GLib.idle_add(self.app.quit)
+            return
+        saved = read_clipboard()
+        copy_text(text)
+        wid = target["id"]
+        run(["xdotool", "windowactivate", "--sync", wid], timeout=2)
+        # The keystroke must not leave before the target really has the keys.
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            front = run(["xdotool", "getactivewindow"], timeout=1)
+            if front == wid:
+                break
+            time.sleep(0.03)
+        time.sleep(0.1)  # a moment for its widget to take the focus back
+        # Never type into anything else: the keystroke goes to whatever has
+        # the focus. The entry stays on the clipboard for a manual paste.
+        front = run(["xdotool", "getactivewindow"], timeout=1)
+        if front != wid:
+            log("paste: %s is not the active window (gone, or the focus moved): no keystroke, "
+                "the entry is left on the clipboard" % target["class"])
+            GLib.idle_add(self.app.quit)
+            return
+        terminal = is_terminal_class(target["class"])
+        ok = paste_keystroke(terminal)
+        log("paste: %s into %s, %s" % ("Ctrl+Shift+V" if terminal else "Ctrl+V", target["class"],
+                                      "keystroke sent" if ok else "keystroke failed"))
+        time.sleep(0.3)  # the app reads the clipboard after the keystroke
+        if saved is not None:
+            copy_text(saved)
+        GLib.idle_add(self.app.quit)
+
+    def edit_entry(self, row):
+        """A3 edit: the row's text becomes a field, its actions Cancel and
+        Save, the other rows dim, the footer shows the editor's keys."""
+        if self.editing or self.closing or row not in self.rows:
+            return
+        self.cancel_copy_close()
+        self.dismiss_toast()
+        cancel = RowButton("ghost", "Cancel")
+        cancel.connect("clicked", lambda *_: self.finish_edit(False))
+        save = RowButton("primary", "Save")
+        save.connect("clicked", lambda *_: self.finish_edit(True))
+        field = EditField(row.entry[1])
+        field.view.connect("key-press-event", self.on_field_key)
+        self.editing = (row.entry, field, row)
+        row.enter_edit(field, [cancel, save])
+        for other in self.rows:
+            if other is not row:
+                other.set_dimmed(True)
+            other.refresh(True)
+        self.update_footer()
+        field.view.grab_focus()
+        GLib.timeout_add(50, lambda: self.reveal(row) or False)
+
+    def on_field_key(self, _view, event):
+        """↩ Save, ⇧↩ (or Alt+↩) a new line, esc Cancel."""
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
+            if event.state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.MOD1_MASK):
+                buf = _view.get_buffer()
+                buf.delete_selection(True, True)
+                buf.insert_at_cursor("\n")
+                return True
+            self.finish_edit(True)
+            return True
+        if event.keyval == Gdk.KEY_Escape:
+            self.finish_edit(False)
+            return True
+        return False
+
+    def finish_edit(self, save):
+        """Save or Cancel. A save writes the file first, then learns the
+        changed words off the main thread; the toast says how it went. A
+        failed write keeps the editor open (red border) so Retry can try again."""
+        if not self.editing:
+            return
+        entry, field, row = self.editing
+        new_text = field.text.strip()
+        saved = None
+        if save and new_text and new_text != entry[1]:
+            self.dismiss_toast()
+            if not update_history(entry, new_text):
+                field.set_failed(True)
+                self.show_toast("failed")
+                return
+            saved = new_text
+            index = self.rows.index(row)
+            self.entries[index] = (entry[0], new_text)
+        elif self.toast_kind == "failed":
+            self.dismiss_toast()
+        self.editing = None
+        row.leave_edit(saved)
+        for other in self.rows:
+            other.set_dimmed(False)
+            other.refresh(True)
+        self.update_footer()
+        self.set_focus(None)
+        if self.actions_stale:
+            # Raised during the edit: the Paste target changed, rebuild the buttons.
+            self.actions_stale = False
+            self.rebuild(self.entries, keep_place=True)
+        if self.stale:
+            GLib.timeout_add(200, self.refresh_from_file)
+        if saved is not None:
+            old = entry[1]
+
+            def work():
+                learned = learn_from_edit(old, saved)
+                GLib.idle_add(lambda: self.after_learn(row, learned) or False)
+            threading.Thread(target=work, daemon=True).start()
+
+    def after_learn(self, row, learned):
+        if self.closing:
+            return
+        if learned and row in self.rows:
+            row.highlight_words(learned)
+        # A later edit's "Could not save" (and its Retry) outranks this news.
+        if self.toast_kind == "failed":
+            return
+        self.show_toast("learned" if learned else "saved", learned)
+
+    def unlearn(self, words, chip):
+        chip.set_sensitive(False)
+
+        def work():
+            ok = unlearn_words(words)
+            GLib.idle_add(lambda: (not self.closing and self.show_toast("unlearned", words, failed=not ok)) or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ----- toasts (A4) -------------------------------------------------------------
+
+    def show_toast(self, kind, words=(), failed=False):
+        """Saved (1.8 s), Learned + Unlearn (3.5 s, paused while hovered),
+        Could not save + Retry (6 s), Unlearned (1.8 s). In 200 ms, y +8."""
+        self.dismiss_toast(animated=False)
+        esc = GLib.markup_escape_text
+        listed = ", ".join('<span weight="600" foreground="%s">%s</span>' % (INK, esc(w)) for w in words)
+        box = Gtk.Box(spacing=8)
+        box.get_style_context().add_class("toast")
+        chip = None
+        if kind in ("saved", "learned"):
+            check = icon("object-select-symbolic", 12)
+            check.get_style_context().add_class("ok")
+            box.pack_start(check, False, False, 0)
+            text = label("")
+            text.set_markup("Saved" if kind == "saved" else "Learned: " + listed)
+        elif kind == "failed" or failed:
+            warn = icon("dialog-warning-symbolic", 12)
+            warn.get_style_context().add_class("bad")
+            box.pack_start(warn, False, False, 0)
+            text = label("Could not save" if kind == "failed" else "Could not unlearn", "bad")
+        else:
+            text = label("")
+            text.set_markup("Unlearned " + listed)
+        text.set_ellipsize(Pango.EllipsizeMode.END)
+        box.pack_start(text, False, False, 0)
+        if kind == "learned":
+            chip = Gtk.Button(label="Unlearn")
+            chip.connect("clicked", lambda *_: self.unlearn(list(words), chip))
+        elif kind == "failed":
+            chip = Gtk.Button(label="Retry")
+            chip.connect("clicked", lambda *_: self.finish_edit(True))
+        if chip is not None:
+            chip.set_can_focus(False)
+            chip.get_style_context().add_class("chip")
+            box.get_style_context().add_class("with-chip")
+            box.pack_start(chip, False, False, 0)
+        holder = Gtk.EventBox()
+        holder.add(box)
+        holder.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        if kind == "learned":
+            holder.connect("enter-notify-event", lambda _w, e: e.detail != Gdk.NotifyType.INFERIOR
+                           and self.toast_hovered(True))
+            holder.connect("leave-notify-event", lambda _w, e: e.detail != Gdk.NotifyType.INFERIOR
+                           and self.toast_hovered(False))
+        self.toast_slot.pack_start(holder, False, False, 0)
+        holder.show_all()
+        self.toast, self.toast_kind = holder, kind
+        rise = 0 if self.reduce else 8
+
+        def step(e):
+            holder.set_opacity(e)
+            self.toast_slot.set_margin_bottom(int(32 + 12 - rise * (1 - e)))
+        Tween(0.2, CURVE_OUT, step)
+        self.hold_toast({"saved": 1.8, "unlearned": 1.8, "learned": 3.5, "failed": 6}[kind])
+
+    def hold_toast(self, seconds):
+        if self.toast_hold:
+            GLib.source_remove(self.toast_hold)
+        self.toast_remaining = seconds
+        self.toast_deadline = time.monotonic() + seconds
+        self.toast_hold = GLib.timeout_add(int(seconds * 1000), self.toast_expired)
+
+    def toast_expired(self):
+        self.toast_hold = None
+        self.dismiss_toast()
+        return False
+
+    def toast_hovered(self, inside):
+        """Learned holds while the pointer is on it, then runs out what was left."""
+        if self.toast is None:
+            return False
+        if inside and self.toast_hold:
+            GLib.source_remove(self.toast_hold)
+            self.toast_hold = None
+            self.toast_remaining = max(0, self.toast_deadline - time.monotonic())
+        elif not inside and self.toast_hold is None:
+            self.hold_toast(max(0.6, self.toast_remaining))
+        return False
+
+    def dismiss_toast(self, animated=True):
+        """Out: 180 ms, curve in, fade."""
+        if self.toast_hold:
+            GLib.source_remove(self.toast_hold)
+            self.toast_hold = None
+        toast, self.toast, self.toast_kind = self.toast, None, None
+        if toast is None:
+            return
+        if not animated:
+            self.toast_slot.remove(toast)
+            return
+        alpha = toast.get_opacity()
+
+        def done():
+            if toast.get_parent() is self.toast_slot:
+                self.toast_slot.remove(toast)
+        Tween(0.18, CURVE_IN, lambda e: toast.set_opacity(alpha * (1 - e)), done)
+
+    # ----- placement, focus, open and close -------------------------------------
+
+    def monitor_area(self):
+        display = Gdk.Display.get_default()
+        monitor = None
+        try:
+            _screen, px, py = display.get_default_seat().get_pointer().get_position()[:3]
+            monitor = display.get_monitor_at_point(px, py)
+        except Exception:
+            pass
+        monitor = monitor or display.get_primary_monitor() or display.get_monitor(0)
+        return monitor.get_workarea()
+
+    def saved_size(self):
+        try:
+            with open(SIZE_FILE) as f:
+                w, h = json.load(f)
+            return int(w), int(h)
+        except (OSError, ValueError, TypeError):
+            return DEFAULT_SIZE
+
+    def save_size(self):
+        x, y, w, h = self.card_rect()
+        try:
+            os.makedirs(os.path.dirname(SIZE_FILE), exist_ok=True)
+            with open(SIZE_FILE, "w") as f:
+                json.dump([w, h], f)
+        except OSError:
+            pass
+
+    def frame(self):
+        """Centred, bottom edge on the pill's line, 12 inside the work area."""
+        area = self.monitor_area()
+        max_w, max_h = area.width - 2 * SCREEN_MARGIN, area.height - HEIGHT_RESERVE
+        w, h = self.saved_size()
+        w = max(MIN_SIZE[0], min(max_w, w))
+        h = max(MIN_SIZE[1], min(max_h, h))
+        x = area.x + (area.width - w) // 2
+        y = area.y + area.height - BOTTOM_GAP - h
+        x = max(area.x + SCREEN_MARGIN, min(area.x + area.width - SCREEN_MARGIN - w, x))
+        y = max(area.y + SCREEN_MARGIN, min(area.y + area.height - SCREEN_MARGIN - h, y))
+        geometry = Gdk.Geometry()
+        geometry.min_width, geometry.min_height = MIN_SIZE[0] + 2 * self.margin, MIN_SIZE[1] + 2 * self.margin
+        geometry.max_width, geometry.max_height = max_w + 2 * self.margin, max_h + 2 * self.margin
+        self.set_geometry_hints(None, geometry, Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE)
+        return x - self.margin, y - self.margin, w + 2 * self.margin, h + 2 * self.margin
+
+    def server_time(self):
+        window = self.get_window()
+        if GdkX11 is not None and window is not None and isinstance(window, GdkX11.X11Window):
+            try:
+                return GdkX11.x11_get_server_time(window)
+            except Exception:
+                pass
+        return Gtk.get_current_event_time()
+
+    def take_keys(self):
+        """Present with a fresh timestamp so the window manager lets it have
+        the keys; once more through xdotool if it still has not."""
+        if self.awaiting_focus or self.closing:
+            return
+        self.set_accept_focus(True)
+        self.present_with_time(self.server_time())
+
+        def check():
+            if not self.is_active() and not self.closing and not self.awaiting_focus:
+                window = self.get_window()
+                if window is not None and hasattr(window, "get_xid") and shutil.which("xdotool"):
+                    run(["xdotool", "windowactivate", str(window.get_xid())], timeout=1)
+            return False
+        GLib.timeout_add(250, check)
 
     def present_animated(self):
-        """Fade in and rise into place, picking up where the pill left off."""
-        self.widget_set_opacity(0.0)
-        target = None
-        if not IS_WAYLAND:
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor() or display.get_monitor(0)
-            geom = monitor.get_geometry()
-            width, height = self.get_default_size()
-            target = (geom.x + (geom.width - width) // 2,
-                      geom.y + geom.height - height - 130)
-            self.move(target[0], target[1] + SLIDE_PX)
+        """Open (A8): 220 ms after 40, curve out; rise 24 and fade in."""
+        x, y, w, h = self.frame()
+        rise = 0 if self.reduce else 24
+        self.resize(w, h)
+        self.move(x, y + rise)
+        self.set_opacity(0)
+        self.pipeline = pipeline_pid()
+        if self.pipeline is not None:
+            # Opened while a dictation runs (History chip on its pill): its
+            # paste must reach the user's app, so no keys until it is done.
+            self.hold_keys()
+        else:
+            self.set_accept_focus(True)
         self.show_all()
-        self.present()
-        # Start on the newest Copy button (Enter copies the last dictation)
-        # rather than in a selectable label with a blinking caret.
-        if self.first_button:
-            self.first_button.grab_focus()
-        start = GLib.get_monotonic_time()
+        if not self.awaiting_focus:
+            self.take_keys()
+        if self.motion:
+            self.motion.stop()
 
-        def step():
-            p = min(1.0, (GLib.get_monotonic_time() - start) / (FADE_MS * 1000))
-            eased = 1.0 - (1.0 - p) ** 3
-            self.widget_set_opacity(eased)
-            if target:
-                self.move(target[0], int(target[1] + SLIDE_PX * (1.0 - eased)))
-            return p < 1.0
-        GLib.timeout_add(16, step)
+        def step(e):
+            self.set_opacity(e)
+            self.move(x, int(y + rise * (1 - e)))
+        self.motion = Tween(0.22, CURVE_OUT, step, delay=0.04)
+
+    def hold_keys(self):
+        log("dictation running: window shown without the keys")
+        self.awaiting_focus = True
+        self.set_accept_focus(False)
+
+    def watch_pipeline(self):
+        """Every 0.25 s: a dictation starting closes the window (unless an
+        entry is being edited: dictating into the editor is fine); one
+        finishing gives the keys to a window shown during it."""
+        now = pipeline_pid()
+        was, self.pipeline = self.pipeline, now
+        if self.closing:
+            return True
+        if now is not None and now != was:
+            log("dictation started")
+            if self.editing is None:
+                self.close_animated()
+        elif now is None and was is not None:
+            log("dictation finished, awaiting keys %s" % self.awaiting_focus)
+            if self.awaiting_focus:
+                self.awaiting_focus = False
+                self.take_keys()
+        return True
+
+    def on_focus_in(self, *_):
+        self.ever_focused = True
+        return False
+
+    def on_focus_out(self, *_):
+        """A click elsewhere closes the window, except over an edit in progress."""
+        if self.ever_focused and not self.closing and self.editing is None and not self.awaiting_focus \
+                and not self.resizing:
+            GLib.timeout_add(80, self.close_if_unfocused)
+        return False
+
+    def close_if_unfocused(self):
+        if not self.is_active() and not self.closing and self.editing is None:
+            self.close_animated(hand_back=False)
+        return False
+
+    def close_animated(self, hand_back=True):
+        """Close (A8): 160 ms, curve in; fade out and drop 12, then quit.
+        `hand_back`: give the keys back to the user's window (esc, ×, ↩, a
+        new dictation); not after a click elsewhere, which chose its own."""
+        if self.closing:
+            return
+        if self.editing:
+            entry, field, _row = self.editing
+            # Never close over unsaved changes; esc cancels the edit first.
+            if field.text.strip() != entry[1]:
+                self.error_bell()
+                self.cancel_copy_close()
+                return
+            self.editing = None
+        self.closing = True
+        if self.motion:
+            self.motion.stop()
+        pos = self.get_position()
+        alpha = self.get_opacity()
+        drop = 0 if self.reduce else 12
+        had_keys = self.is_active()
+
+        def step(e):
+            self.set_opacity(alpha * (1 - e))
+            self.move(pos[0], int(pos[1] + drop * e))
+
+        def done():
+            self.hide()
+            if hand_back and had_keys and self.return_window:
+                run(["xdotool", "windowactivate", self.return_window["id"]], timeout=1)
+            self.app.quit()
+        self.motion = Tween(0.16, CURVE_IN, step, done)
+
+    def error_bell(self):
+        window = self.get_window()
+        if window is not None:
+            window.beep()
+
+    def raise_again(self, target):
+        """A second launch: Paste now goes where the user was, the list comes
+        back to the newest, and the window takes the keys (unless a dictation
+        runs)."""
+        if self.pasting:
+            return
+        self.cancel_copy_close()
+        if target is not None:
+            self.return_window = target["window"]
+            self.target = target["window"] if target["editable"] else None
+        if self.editing:
+            self.actions_stale = True
+            self.update_footer()
+        self.populate()
+        if pipeline_pid() is not None and self.editing is None:
+            self.pipeline = pipeline_pid()
+            self.hold_keys()
+        if self.closing and self.get_visible():
+            self.closing = False
+            self.present_animated()
+        elif not self.closing:
+            if self.awaiting_focus:
+                self.show()
+            else:
+                self.take_keys()
+
+
+class Probe:
+    """Does the window the user was in have a focused field that takes
+    typing? Asked through xhisper-learn (AT-SPI) before our window takes the
+    focus, capped so the window never waits long."""
+
+    def __init__(self, window):
+        self.window = window
+        self.proc = None
+        self.result = None if window else False
+        if window and window.get("pid"):
+            try:
+                self.proc = subprocess.Popen([sibling("xhisper-learn"), "editable", str(window["pid"])],
+                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+            except OSError:
+                self.result = False
+        elif window:
+            self.result = False
+
+    def poll(self):
+        if self.result is None and self.proc is not None:
+            rc = self.proc.poll()
+            if rc is not None:
+                self.result = rc == 0
+        return self.result
+
+    def give_up(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+        self.result = False
+
+
+PROBE_SECONDS = 1.0
 
 
 class HistoryApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="io.github.abszar.xhisper.History")
         self.window = None
+        self.probe = None
+        self.waiting = False
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
-        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        try:
+            os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+            with open(PID_FILE, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
+        settings = Gtk.Settings.get_default()
+        settings.set_property("gtk-application-prefer-dark-theme", True)
         # Selectable labels would otherwise select all their text when focused.
-        Gtk.Settings.get_default().set_property("gtk-label-select-on-focus", False)
+        settings.set_property("gtk-label-select-on-focus", False)
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
+        provider.load_from_data(CSS.encode("utf-8"))
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.probe = Probe(LAUNCH_TARGET)
+
+    def do_shutdown(self):
+        try:
+            with open(PID_FILE) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.unlink(PID_FILE)
+        except OSError:
+            pass
+        Gtk.Application.do_shutdown(self)
 
     def do_activate(self):
-        if self.window:
-            self.window.populate()
-            self.window.present()
+        if self.waiting:
             return
+        if self.window is not None:
+            # Raised by a second launch: who has the focus now (not us)?
+            target = active_window()
+            own = self.window.get_window()
+            if target is not None and own is not None and hasattr(own, "get_xid") \
+                    and target["id"] == str(own.get_xid()):
+                target = None
+            if target is None:
+                self.window.raise_again(None)
+                return
+            self.probe = Probe(target)
+            self.await_probe(lambda ok: self.window.raise_again({"window": target, "editable": ok}))
+            return
+        self.await_probe(self.open_window)
+
+    def await_probe(self, then):
+        """Wait (at most PROBE_SECONDS) for the paste-target check, without
+        blocking the main loop."""
+        self.waiting = True
+        self.hold()  # no window yet: the app must not end while it waits
+        deadline = time.monotonic() + PROBE_SECONDS
+
+        def check():
+            result = self.probe.poll()
+            if result is None and time.monotonic() < deadline:
+                return True
+            if result is None:
+                log("paste target check took over %.1f s: no Paste" % PROBE_SECONDS)
+                self.probe.give_up()
+            self.waiting = False
+            then(bool(self.probe.result))
+            self.release()
+            return False
+        if check():
+            GLib.timeout_add(20, check)
+
+    def open_window(self, editable):
         self.window = HistoryWindow(self)
+        self.window.return_window = LAUNCH_TARGET
+        if LAUNCH_TARGET is not None and editable:
+            self.window.target = LAUNCH_TARGET
+            self.window.populate()
+        log("open: paste target %s, return window %s"
+            % (LAUNCH_TARGET["class"] if (LAUNCH_TARGET and editable) else "none",
+               LAUNCH_TARGET["class"] if LAUNCH_TARGET else "none"))
         self.window.present_animated()
 
 

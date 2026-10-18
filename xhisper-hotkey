@@ -12,6 +12,10 @@
 # other machine, a game, a lock screen) the grab cannot fire, which is what
 # we want.
 #
+# Double tap: a second Alt+Ctrl within 0.5 s of one that started a recording
+# opens the History window instead of toggling (the recording it started is
+# cancelled through the History flag, and its pill rises into the window).
+#
 # Started at login from ~/.config/autostart/xhisper-hotkey.desktop.
 # Only one instance runs per session (flock on the runtime dir).
 
@@ -22,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from ctypes import c_char, c_char_p, c_int, c_uint, c_ulong, c_void_p
 
@@ -33,6 +38,91 @@ MOD2_MASK = 1 << 4   # Num Lock
 KEY_PRESS = 2
 GRAB_MODE_ASYNC = 1
 CURRENT_TIME = 0
+DOUBLE_TAP_SECONDS = 0.5
+PIPELINE_MAX_AGE = 1800  # past this an xhisper.pid names a wedged run, not a live one
+
+
+def runtime_dir():
+    """Same rule as xhisper.sh: XHISPER_RUNTIME_DIR, else XDG_RUNTIME_DIR/xhisper."""
+    return os.environ.get("XHISPER_RUNTIME_DIR") or os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "xhisper")
+
+
+def sibling(name):
+    """A helper next to us (checkout) or the installed one."""
+    path = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), name)
+    return path if os.access(path, os.X_OK) else (shutil.which(name) or "/usr/local/bin/" + name)
+
+
+def live_pid(path, needle):
+    """The pid in `path` ("PID [EPOCH]") when it is alive and running `needle`."""
+    try:
+        with open(path) as f:
+            parts = f.read().split()
+        pid = int(parts[0])
+        os.kill(pid, 0)
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if needle.encode() not in f.read():
+                return None
+        if len(parts) > 1 and time.time() - float(parts[1]) > PIPELINE_MAX_AGE:
+            return None
+        return pid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class DoubleTap:
+    """Two combos in quick succession open History: the second within
+    DOUBLE_TAP_SECONDS of a first that started a recording. A combo that
+    stopped a recording never starts a double tap, so a quick stop-then-start
+    still records. Times come from a monotonic clock."""
+
+    def __init__(self):
+        self.started_at = None
+
+    def fired(self, now, recording_live):
+        if self.started_at is not None and now - self.started_at <= DOUBLE_TAP_SECONDS:
+            self.started_at = None
+            return True
+        self.started_at = None if recording_live else now
+        return False
+
+
+def open_history(runtime):
+    """Drop the History flag, as the pill's History chip does: the recording
+    the first tap started cancels on it, and its pill rises into the window.
+    The run may still be starting (it clears stale flags), so the flag is
+    written again while it lives; and with no window after 1.2 s (no pill
+    took it), open the window ourselves."""
+    flag = os.path.join(runtime, "xhisper.history")
+    pidfile = os.path.join(runtime, "xhisper.pid")
+
+    def drop():
+        try:
+            os.close(os.open(flag, os.O_WRONLY | os.O_CREAT, 0o600))
+        except OSError:
+            pass
+
+    def again():
+        if live_pid(pidfile, "xhisper") and not os.path.exists(flag):
+            drop()
+
+    def fallback():
+        if live_pid(os.path.join(runtime, "xhisper-history.pid"), "xhisper-history"):
+            return
+        print("xhisper-hotkey: no History window from the pill, opening it", file=sys.stderr)
+        try:
+            subprocess.Popen([sibling("xhisper-history")], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            pass
+
+    drop()
+    for delay, action in ((0.3, again), (0.6, again), (1.2, fallback)):
+        timer = threading.Timer(delay, action)
+        timer.daemon = True
+        timer.start()
 
 
 def fail(msg):
@@ -55,6 +145,8 @@ def main():
         fail("Wayland is not supported; bind xhisper in your desktop's shortcut settings instead")
 
     xhisper = os.environ.get('XHISPER_CMD') or shutil.which('xhisper') or '/usr/local/bin/xhisper'
+    runtime = runtime_dir()
+    double_tap = DoubleTap()
     _lock = single_instance()
 
     try:
@@ -132,8 +224,12 @@ def main():
             continue
         X11.XUngrabKeyboard(display, CURRENT_TIME)
         X11.XFlush(display)
-        subprocess.Popen([xhisper, '--toggle'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        live = live_pid(os.path.join(runtime, 'xhisper.pid'), 'xhisper') is not None
+        if double_tap.fired(time.monotonic(), live):
+            open_history(runtime)
+        else:
+            subprocess.Popen([xhisper, '--toggle'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
         # One launch per press: Ctrl auto-repeats while held, and each repeat
         # re-fires the grab. In toggle mode a repeat would stop the recording
         # it just started, so this debounce is required, not an optimisation.
