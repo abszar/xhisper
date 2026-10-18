@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""xhisper-tray: a dictation button in the top bar's tray (X11).
+
+Click it to start dictating, click it again to stop: each click runs
+`xhisper --toggle`, like the Alt then Ctrl hotkey. Middle-click to stop and
+send: `xhisper --send` presses Enter after the paste (a chat message, a Claude
+Code prompt). Right click for a menu (Stop and send, History, Quit).
+
+Not a double click: GNOME's microphone indicator appears in the top bar while
+recording and vanishes on the stop, shifting the tray icons under the pointer,
+so a second click landed on a neighbouring icon (user, 2026-10-18). The icon is the xhisper mark: light while idle, coral while
+recording, dimmed while the dictation is transcribed and pasted.
+
+It is a legacy (XEmbed) tray icon, Gtk.StatusIcon, on purpose: GNOME's
+AppIndicator extension opens an AppIndicator's menu on a left click and only
+activates it on a double click, but it hands every click straight to a legacy
+icon. A click on the top bar hands the keyboard focus to GNOME Shell for a
+moment (no active window), and xhisper then pastes nowhere (2026-10-18: the
+log showed `Class: []` and the text did not land). So the tray remembers the
+last window that had the focus and gives it back before each toggle.
+
+Started at login from ~/.config/autostart/xhisper-tray.desktop. One instance
+per session (flock on the runtime dir).
+"""
+
+import fcntl
+import os
+import shutil
+import subprocess
+import sys
+import time
+import warnings
+
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib
+    import cairo
+except (ImportError, ValueError):
+    print("xhisper-tray: PyGObject (GTK 3) is required", file=sys.stderr)
+    sys.exit(1)
+
+# Gtk.StatusIcon is deprecated in GTK 3 but still the only icon that gets a
+# plain click from the GNOME tray extension (see above).
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+RUNTIME_DIR = os.environ.get("XHISPER_RUNTIME_DIR") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "xhisper")
+PIPELINE_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper.pid")
+RECORDING = os.path.join(RUNTIME_DIR, "xhisper.wav")
+POLL_MS = 200
+CLICK_GUARD_SECONDS = 0.35  # a double click is one action, never start + stop
+
+INK = (237 / 255, 232 / 255, 217 / 255)
+CORAL = (232 / 255, 115 / 255, 102 / 255)
+MARK = [5, 9, 14, 8, 11]  # the History window's header mark, on a 14 high box
+
+
+def sibling(name):
+    """A helper next to us (checkout) or the installed one."""
+    path = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), name)
+    return path if os.access(path, os.X_OK) else (shutil.which(name) or "/usr/local/bin/" + name)
+
+
+def xhisper_command():
+    return os.environ.get("XHISPER_CMD") or shutil.which("xhisper") or "/usr/local/bin/xhisper"
+
+
+def single_instance():
+    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "xhisper-tray.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)  # already running in this session
+    return lock
+
+
+def pipeline_live():
+    """xhisper.pid ("PID EPOCH") names a live xhisper run."""
+    try:
+        with open(PIPELINE_PID_FILE) as f:
+            parts = f.read().split()
+        pid = int(parts[0])
+        os.kill(pid, 0)
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"xhisper" not in f.read():
+                return False
+        return not (len(parts) > 1 and time.time() - float(parts[1]) > 1800)
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def current_state():
+    """idle, recording (the WAV still grows) or working (transcribing, pasting)."""
+    if not pipeline_live():
+        return "idle"
+    try:
+        if time.time() - os.path.getmtime(RECORDING) < 0.6:
+            return "recording"
+    except OSError:
+        pass
+    return "working"
+
+
+def draw_icon(size, state):
+    """The five-bar mark, centred, in the state's colour."""
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surface)
+    color, alpha = {"idle": (INK, 1.0), "recording": (CORAL, 1.0), "working": (INK, 0.55)}[state]
+    scale = size * 0.72 / 14
+    width, gap = 2 * scale, 1.5 * scale
+    total = len(MARK) * width + (len(MARK) - 1) * gap
+    x0 = (size - total) / 2
+    cr.set_source_rgba(color[0], color[1], color[2], alpha)
+    for i, h in enumerate(MARK):
+        h *= scale
+        x, y, r = x0 + i * (width + gap), (size - h) / 2, width / 2
+        cr.new_sub_path()
+        cr.arc(x + r, y + r, r, 3.14159265, 0)
+        cr.arc(x + r, y + h - r, r, 0, 3.14159265)
+        cr.close_path()
+    cr.fill()
+    return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
+
+
+TOOLTIPS = {
+    "idle": "xhisper: click to dictate",
+    "recording": "xhisper: recording, click to stop",
+    "working": "xhisper: transcribing",
+}
+
+
+class Tray:
+    def __init__(self):
+        self.icon = Gtk.StatusIcon()
+        self.icon.set_title("xhisper")
+        self.icon.set_name("xhisper")
+        self.state = None
+        self.size = 22
+        self.last_click = 0.0
+        self.last_window = None  # XID of the last real window with the focus
+        self.icon.connect("activate", self.on_click)
+        self.icon.connect("popup-menu", self.on_menu)
+        self.icon.connect("button-press-event", self.on_button)
+        self.icon.connect("size-changed", self.on_size)
+        self.icon.set_visible(True)
+        self.refresh()
+        GLib.timeout_add(POLL_MS, self.refresh)
+
+    def on_size(self, _icon, size):
+        if size > 0 and size != self.size:
+            self.size = size
+            self.state = None  # redraw at the new size
+            self.refresh()
+        return True
+
+    def active_window(self):
+        """XID of the window with the focus, None while the shell has it."""
+        try:
+            window = Gdk.Screen.get_default().get_active_window()
+            return window.get_xid() if window is not None else None
+        except Exception:
+            return None
+
+    def refresh(self):
+        xid = self.active_window()
+        if xid:
+            self.last_window = xid
+        state = current_state()
+        if state != self.state:
+            self.state = state
+            self.icon.set_from_pixbuf(draw_icon(self.size, state))
+            self.icon.set_tooltip_text(TOOLTIPS[state])
+        return True
+
+    def run(self, args):
+        try:
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            print("xhisper-tray: %s" % e, file=sys.stderr)
+
+    def on_click(self, _icon):
+        now = time.monotonic()
+        if now - self.last_click < CLICK_GUARD_SECONDS:
+            return  # a double click: one toggle, never start then stop
+        self.last_click = now
+        self.restore_focus()
+        self.run([xhisper_command(), "--toggle"])
+        # Show the change at once; the poll confirms it.
+        GLib.timeout_add(150, lambda: self.refresh() and False)
+
+    def restore_focus(self):
+        """Give the keys back to the user's window: xhisper reads the active
+        window to choose where (and how) to paste."""
+        if not self.active_window() and self.last_window and shutil.which("xdotool"):
+            try:
+                subprocess.run(["xdotool", "windowactivate", "--sync", str(self.last_window)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def on_button(self, icon, event):
+        """Middle click: stop and send, while a dictation runs."""
+        if event.button != 2 or event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        if pipeline_live():
+            self.send(icon)
+        return True
+
+    def send(self, _icon):
+        self.restore_focus()
+        self.run([xhisper_command(), "--send"])
+
+    def on_menu(self, icon, button, activate_time):
+        menu = Gtk.Menu()
+        live = pipeline_live()
+        toggle = Gtk.MenuItem(label="Stop dictation" if live else "Start dictation")
+        toggle.connect("activate", lambda *_: self.on_click(icon))
+        send = Gtk.MenuItem(label="Stop and send (Enter)")
+        send.set_sensitive(live)
+        send.connect("activate", lambda *_: self.send(icon))
+        history = Gtk.MenuItem(label="History")
+        history.connect("activate", lambda *_: self.run([sibling("xhisper-history")]))
+        quit_item = Gtk.MenuItem(label="Quit tray button")
+        quit_item.connect("activate", lambda *_: Gtk.main_quit())
+        for item in (toggle, send, history, Gtk.SeparatorMenuItem(), quit_item):
+            menu.append(item)
+        menu.show_all()
+        self.menu = menu  # keep it alive while it is shown
+        menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, activate_time)
+
+
+def main():
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        print("xhisper-tray: X11 only (GNOME on Wayland has no legacy tray)", file=sys.stderr)
+        return 1
+    _lock = single_instance()
+    Tray()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

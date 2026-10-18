@@ -57,6 +57,7 @@ LOGFILE="$RUNTIME_DIR/xhisper.log"
 PIDFILE="$RUNTIME_DIR/xhisper.pid"
 STOPFILE="$RUNTIME_DIR/xhisper.stop"
 HISTORYFLAG="$RUNTIME_DIR/xhisper.history"
+SUBMITFILE="$RUNTIME_DIR/xhisper.submit"
 CONTEXT_FILE="$RUNTIME_DIR/screen-context.txt"
 BEFORE_FILE="$RUNTIME_DIR/caret-before.txt"
 LLM_REQUEST="$RUNTIME_DIR/llm-request.json"
@@ -87,6 +88,7 @@ Options:
   --local     Use the binaries next to this script instead of the installed ones
   --log       Print the log ($LOGFILE) and exit
   --stop      Stop a recording that is currently running and exit
+  --send      Like --stop, then press Enter after the paste (Linux)
   --toggle    Press-once mode: record until the next --toggle (no holding).
               Needs a trigger that fires once per press, like xhisper-hotkey
   --history   Show the last dictations, with a copy button for each
@@ -123,6 +125,12 @@ for arg in "$@"; do
       ;;
     --stop)
       touch "$STOPFILE"
+      exit 0
+      ;;
+    --send)
+      # Stop like --stop, and press Enter right after the paste (the tray
+      # button's double click: dictate a chat message and send it).
+      touch "$SUBMITFILE" "$STOPFILE"
       exit 0
       ;;
     --toggle)
@@ -348,7 +356,7 @@ if [ -f "$PIDFILE" ]; then
   fi
   rm -f "$PIDFILE"
 fi
-rm -f "$STOPFILE" "$HISTORYFLAG"
+rm -f "$STOPFILE" "$HISTORYFLAG" "$SUBMITFILE"
 printf '%s %s\n' "$$" "$(date +%s)" > "$PIDFILE"
 # A new dictation ends the correction watcher of the previous one.
 if [ -f "$RUNTIME_DIR/xhisper-learn.pid" ]; then
@@ -1202,7 +1210,7 @@ cleanup() {
   # every 25 ms) and must still see it to rise into the window. The next run
   # clears it before its own pill comes up.
   [ "${KEY_RC:-0}" -eq 5 ] || rm -f "$HISTORYFLAG"
-  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$LLM_REQUEST" "$CONTEXT_FILE" "$BEFORE_FILE" "$TRANSCRIPT_FILE" "$WINDOW_FILE" "$WINDOW_CLASS_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
+  rm -f "$RECORDING" "$PIDFILE" "$STOPFILE" "$SUBMITFILE" "$LLM_REQUEST" "$CONTEXT_FILE" "$BEFORE_FILE" "$TRANSCRIPT_FILE" "$WINDOW_FILE" "$WINDOW_CLASS_FILE" "$RUNTIME_DIR/xhisper.listening" "$RUNTIME_DIR/xhisper.cancel"
   if [ -n "$SAVED_CLIPBOARD" ]; then
     printf '%s' "$SAVED_CLIPBOARD" | $CLIP_COPY
   fi
@@ -1454,6 +1462,19 @@ if [ -n "$BEFORE_PID" ]; then
   rm -f "$BEFORE_FILE"
 fi
 paste "$PASTE_TEXT" "$IS_TERMINAL"
+# --send: Enter after the paste. The app fetches the clipboard asynchronously
+# (a terminal's bracketed paste too), so an Enter right behind Ctrl+V could be
+# handled before the text arrives: give it a moment first.
+if [ -f "$SUBMITFILE" ]; then
+  rm -f "$SUBMITFILE"
+  if [ "$OS" = "Darwin" ]; then
+    log_line "Send: Enter after the paste is not supported on macOS yet"
+  else
+    sleep 0.3
+    "$XHISPERTOOL" type $'\n'
+    log_line "Send: pressed Enter after the paste"
+  fi
+fi
 # The wait the user actually feels: from releasing/stopping to the paste.
 log_line "=== Total ==="
 log_line "Stop to paste: $(elapsed_since "$STOP_TIME")s"

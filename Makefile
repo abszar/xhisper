@@ -76,13 +76,14 @@ test: test.c
 check:
 	@if [ -d tests ]; then python3 -m unittest discover -s tests -v; fi
 
-install: xhispertool xhisper.sh xhisper-notify xhisper-hotkey xhisper-history xhisper-learn
+install: xhispertool xhisper.sh xhisper-notify xhisper-hotkey xhisper-tray xhisper-history xhisper-learn
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 xhispertool $(DESTDIR)$(BINDIR)/xhispertool
 	ln -sf xhispertool $(DESTDIR)$(BINDIR)/xhispertoold
 	install -m 755 xhisper.sh $(DESTDIR)$(BINDIR)/xhisper
 	install -m 755 xhisper-notify $(DESTDIR)$(BINDIR)/xhisper-notify
 	install -m 755 xhisper-hotkey $(DESTDIR)$(BINDIR)/xhisper-hotkey
+	install -m 755 xhisper-tray $(DESTDIR)$(BINDIR)/xhisper-tray
 	install -m 755 xhisper-history $(DESTDIR)$(BINDIR)/xhisper-history
 	install -m 755 xhisper-learn $(DESTDIR)$(BINDIR)/xhisper-learn
 
@@ -92,6 +93,7 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/xhispertoold
 	rm -f $(DESTDIR)$(BINDIR)/xhisper-notify
 	rm -f $(DESTDIR)$(BINDIR)/xhisper-hotkey
+	rm -f $(DESTDIR)$(BINDIR)/xhisper-tray
 	rm -f $(DESTDIR)$(BINDIR)/xhisper-history
 	rm -f $(DESTDIR)$(BINDIR)/xhisper-learn
 endif

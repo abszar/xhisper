@@ -53,6 +53,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 | Smart spacing between dictations (`smart-spacing`) | ✅ AT-SPI (GTK field, Tilix, Chrome textarea: empty field, after ".", after a space and "("; a later fix is still learned); last-paste fallback ✅ for unreadable fields (same app within 2 min, not another app, not after 2 min). Chrome ✅ re-tested 2026-10-12 after the stale-document fix: claude.ai composer (one space after "finished?", none on an empty new paragraph or in an empty composer), Gmail body (same three), plain textarea (empty, after "?", new line, after "("); GTK Text Editor and Tilix unchanged ✅ | ✅ TextEdit (empty field, after ".", after a space and "("; a later fix is still learned), Chrome (address bar, claude.ai rich editor: one space after text, none on an empty new line); cmux ✅ via the last-paste fallback (its terminal exposes no text, so no learning there) |
 | Silent recordings discarded, even with a hotkey click in them (`min-speech-seconds`) | ✅ real microphone (TONOR, Alt → Ctrl toggle): 5.5 s of silence with the hotkey clicks discarded (Voiced 0.24 s), "yes" kept (0.51 s), a sentence kept (1.41 s); test files ✅ (silence, noise, one or two clicks discarded; speech 30 dB quieter kept) | ⏳ real microphone (TONOR, Option → Control toggle): silence measured 0.00 s (discarded) and 0.30 s (kept: Whisper returned "." and it was pasted); "yes" kept (0.48 s), a sentence kept (1.02 s) |
 | Paste and Escape inside Claude Code in Terminal.app / iTerm2 | ✅ | ✅ iTerm2 (tap, hold, Escape not reaching Claude Code); Terminal.app ⏳ untested |
+| Top bar button: click to start/stop, middle click or menu to stop and send (Enter after the paste) | ✅ X11 (`xhisper-tray`, 2026-10-18: Tilix, Claude Code prompt sent with the menu and with a middle click) | ⏳ (no menu bar item yet; `--send` logs "not supported") |
 | Paste keyboard repaired after a suspend left it detached | ✅ X11 (device floated with `xinput disable`: caught and daemon restarted, 2026-10-16) | — not needed (Cmd+V goes through Xhisper.app, no uinput device) |
 
 Developers and agents: after any change, say whether the other platform needs work (see CLAUDE.md, "Cross-platform parity") and keep this table current.
@@ -160,6 +161,24 @@ Notes:
 - Set `start-sound`, `stop-sound` and `cancel-sound` in `xhisperrc` for audio cues.
 - Press Escape to cancel a recording.
 - Remove the Pause binding above if you don't want both shortcuts.
+
+#### Alternative: a button in the top bar (X11)
+
+`xhisper-tray` (installed by `make install`) puts the xhisper mark in the top
+bar's tray: click it to start dictating, click again to stop. The mark turns
+coral while recording and dims while the text is transcribed and pasted.
+**Middle-click** it (or right-click → *Stop and send (Enter)*) to stop and press
+Enter after the paste, which sends a chat message or a Claude Code prompt
+(`xhisper --send` does the same from a script). Right-click also opens History.
+
+```sh
+cp xhisper-tray.desktop ~/.config/autostart/
+/usr/local/bin/xhisper-tray &   # start it now without logging out
+```
+
+It needs a tray in the top bar: on Ubuntu the AppIndicators extension shows it
+(its legacy tray is on by default). Not a double click to send: GNOME's
+microphone indicator appears while recording and moves the tray icons on stop.
 
 ---
 

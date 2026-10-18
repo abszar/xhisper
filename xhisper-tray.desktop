@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=xhisper tray button
+Comment=Click the top bar button to start and stop dictating with xhisper
+Exec=/usr/local/bin/xhisper-tray
+Icon=audio-input-microphone
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
