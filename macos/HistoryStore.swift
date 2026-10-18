@@ -27,12 +27,19 @@ enum HistoryStore {
         return s.split(separator: "\n").compactMap(parse).reversed()
     }
 
-    /// "Today 14:03", "Yesterday 09:00", else "01 Oct 08:05" (as xhisper-history).
+    /// Time label for a history row (design A9 "Times"): "Just now" under 1 min, "N min ago"
+    /// under 60 min, "N h ago" under 6 h, then "Today 09:12", "Yesterday 14:03", "Mon 17:20"
+    /// under 7 days, else "12 Oct 09:30". Clock is 24 h HH:mm (not locale-templated).
+    /// Future stamps (clock skew) read "Just now"; an unparsable stamp is returned as is.
     static func describe(_ stamp: String, now: Date = Date(), calendar: Calendar = .current) -> String {
         let parser = DateFormatter()
         parser.locale = Locale(identifier: "en_US_POSIX")
         parser.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
         guard let when = parser.date(from: stamp) else { return stamp }
+        let age = now.timeIntervalSince(when)
+        if age < 60 { return "Just now" }
+        if age < 3600 { return "\(Int(age / 60)) min ago" }
+        if age < 6 * 3600 { return "\(Int(age / 3600)) h ago" }
         let out = DateFormatter()
         out.locale = Locale(identifier: "en_US_POSIX")
         out.timeZone = calendar.timeZone
@@ -42,8 +49,46 @@ enum HistoryStore {
         if let yesterday = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(when, inSameDayAs: yesterday) {
             return "Yesterday " + clock
         }
-        out.dateFormat = "dd MMM HH:mm"
+        out.dateFormat = age < 7 * 86400 ? "EEE HH:mm" : "dd MMM HH:mm"
         return out.string(from: when)
+    }
+
+    /// One display line of an entry: `bullet` is "•" or "N." when the line is a list item.
+    struct DisplayLine: Equatable {
+        let bullet: String?
+        let text: String
+    }
+
+    /// Splits stored text into display lines for the list (design A9 "Lists"): "- ", "* ",
+    /// "• " become a "•" bullet, "N. " keeps its number, anything else has no bullet.
+    /// Display only: Copy and Paste always use the raw stored text.
+    static func displayLines(_ text: String) -> [DisplayLine] {
+        text.components(separatedBy: "\n").map { line in
+            for marker in ["- ", "* ", "\u{2022} "] where line.hasPrefix(marker) {
+                return DisplayLine(bullet: "\u{2022}", text: String(line.dropFirst(marker.count)))
+            }
+            let digits = line.prefix { $0.isASCII && $0.isNumber }
+            if !digits.isEmpty, line.dropFirst(digits.count).hasPrefix(". ") {
+                return DisplayLine(bullet: digits + ".", text: String(line.dropFirst(digits.count + 2)))
+            }
+            return DisplayLine(bullet: nil, text: line)
+        }
+    }
+
+    /// Design A9 "RTL": an entry reads right to left when its first strong
+    /// character does (Hebrew, Arabic, Syriac, Thaana, N'Ko and their
+    /// presentation forms), like CSS `dir="auto"`. Digits and punctuation are
+    /// weak and skipped; no strong character at all means left to right.
+    static func isRightToLeft(_ text: String) -> Bool {
+        for s in text.unicodeScalars {
+            switch s.value {
+            case 0x0590...0x08FF, 0xFB1D...0xFDFF, 0xFE70...0xFEFF, 0x10800...0x10FFF, 0x1E800...0x1EFFF:
+                if s.properties.isAlphabetic { return true }
+            default:
+                if s.properties.isAlphabetic { return false }
+            }
+        }
+        return false
     }
 
     /// Same shape as xhisper.sh's `jq -c` line: {"time":...,"text":...}.

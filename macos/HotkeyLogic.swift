@@ -54,6 +54,26 @@ struct HoldTracker {
     }
 }
 
+/// Two combos in quick succession open the History window: the second one
+/// within `seconds` of a first that started a recording. That recording is
+/// cancelled (it is only the first half of the gesture). A combo that
+/// stopped a recording never starts a double tap, so a quick stop-then-start
+/// still records.
+struct DoubleTap {
+    static let seconds = 0.5
+    private var startedAt: Double?
+
+    /// The combo fired. true: this is the second tap, open History.
+    mutating func comboFired(at time: Double, recordingLive: Bool) -> Bool {
+        if let start = startedAt, time - start <= Self.seconds {
+            startedAt = nil
+            return true
+        }
+        startedAt = recordingLive ? nil : time
+        return false
+    }
+}
+
 /// The key loop in xhisper.sh is `python3 -` (system python's real binary is
 /// named Python). Anything else holding a recycled pid is not listening.
 func isListener(_ argv: [String]) -> Bool {

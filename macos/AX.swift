@@ -42,6 +42,41 @@ enum AXCommand {
         return element(copy(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedUIElementAttribute))
     }
 
+    /// Whether the app's focused element takes typed text (the History
+    /// window's Paste button shows only then).
+    static func hasFocusedTextField(_ pid: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        guard let el = element(copy(app, kAXFocusedUIElementAttribute)) else { return false }
+        let role = (copy(el, kAXRoleAttribute) as? String) ?? ""
+        if ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role) { return true }
+        if copy(el, "AXEditableAncestor") != nil { return true }  // web contenteditable
+        // Other roles with a settable text value (custom editors). Controls whose
+        // value is a number or a choice are settable too, but take no typing.
+        if nonTextRoles.contains(role) || !(copy(el, kAXValueAttribute) is String) { return false }
+        var settable: DarwinBoolean = false
+        return AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable) == .success
+            && settable.boolValue
+    }
+
+    static let nonTextRoles: Set<String> = ["AXSlider", "AXIncrementor", "AXCheckBox", "AXRadioButton",
+                                            "AXPopUpButton", "AXDisclosureTriangle", "AXScrollBar"]
+
+    /// Give the keys back to `pid`'s window. A non-activating panel takes the
+    /// keyboard without deactivating the user's app; once the panel is gone
+    /// the window server leaves the keys with us until that app's window is
+    /// made key again. Returns the AX results, for the log.
+    @discardableResult
+    static func refocus(_ pid: pid_t) -> String {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        guard let window = element(copy(app, kAXFocusedWindowAttribute)) ?? element(copy(app, kAXMainWindowAttribute))
+        else { return "no window" }
+        let main = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        let raise = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        return "main \(main.rawValue), raise \(raise.rawValue)"
+    }
+
     /// role, text and caret (in code points, like Python indices); nil once
     /// the element is gone.
     static func snapshot(_ el: AXUIElement) -> [String: Any]? {

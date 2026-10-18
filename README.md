@@ -15,7 +15,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 - **Escape to cancel** — Press Escape while recording to throw the recording away (the key is swallowed, so it does not also reach the focused app: grabbed on X11, eaten by the hotkey agent on macOS)
 - **Live waveform** — While recording, the pill's bars follow your voice (they read the level of the audio being recorded), and drop to dots when you pause
 - **Learns your words** — Fix a misheard name once ("to Ziam" → "TOSIAM") right where it was pasted, or in the History window, and xhisper adds it to your dictionary. Learned words are sent to Whisper as spelling hints and to the auto-edit model as vocabulary
-- **Dictation history** — The last 20 dictations (`history-size`) are kept in a private file. Open them with `xhisper --history`, or with the **History** chip on the Recording / No sound pill; each one has a **Copy** button
+- **Dictation history** — The last 20 dictations (`history-size`) are kept in a private file. Open them with `xhisper --history`, or with the **History** chip on the Recording / No sound pill (also Failed / Cancelled on macOS); each one has **Copy** and **Edit** icon buttons, plus **Paste** when a text field had the focus (macOS for now)
 - **AI auto-editing** — Removes filler words and stutters, applies spoken self-corrections ("Tuesday, no wait, Wednesday"), turns "new line" into a real line break, and fixes punctuation — without ever rewriting your wording. If the model errors out, times out, or returns something suspicious, the raw transcription is pasted instead, so a bad API response never costs you a dictation
 - **Tone adaptation** — Detects the active window (Slack, Gmail, VS Code, etc.) and lets it influence punctuation and formatting — light for chat, full sentences for email, no Markdown in a terminal. It never changes your words or the length
 - **Personal dictionary** — Add custom words, names, and technical terms to `~/.config/xhisper/dictionary.txt` (or `xhisper-learn add WORD`) to improve Whisper's recognition accuracy; the auto-edit model gets them too, so near-misses are respelled
@@ -45,6 +45,10 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 | Upload starts beside the silence check and window lookup; duration read from the WAV header | ✅ (pw-record writes a plain 44-byte header: same duration as ffprobe, after SIGTERM or SIGKILL) | ✅ |
 | No pause after the recorder stops or around the paste keystroke; stop-to-paste time logged | ✅ (0.79–0.84 s in a terminal) | ✅ (rec/sox WAV complete right after `wait`: same size and header 0.3 s later; 0.90 s TextEdit, 1.10 s Chrome with a 18 s dictation) |
 | History window (Copy, Edit) | ✅ | ✅ native window |
+| History: icon buttons, Paste into the field focused before opening | ⏳ | ✅ (not yet tested by hand) |
+| History window redesign (panel, hover actions, edit mode, toasts, live arrival) | ⏳ | ✅ (not yet tested by hand) |
+| Double tap of the hotkey opens History (↩ then pastes the newest) | ⏳ | ✅ (not yet tested by hand) |
+| Pill redesign (points geometry, in-place Failed/No sound/Cancelled, Editing label) | ⏳ | ✅ (not yet tested by hand) |
 | Learning from corrections (`xhisper-learn`), screen context | ✅ AT-SPI | ✅ Accessibility API in TextEdit; Terminal.app exposes its text (read check only); iTerm2: screen context ✅, learning watcher attaches (a correction there not yet tested). Chrome/Electron: not forced, same limit as Linux |
 | Smart spacing between dictations (`smart-spacing`) | ✅ AT-SPI (GTK field, Tilix, Chrome textarea: empty field, after ".", after a space and "("; a later fix is still learned); last-paste fallback ✅ for unreadable fields (same app within 2 min, not another app, not after 2 min). Chrome ✅ re-tested 2026-10-12 after the stale-document fix: claude.ai composer (one space after "finished?", none on an empty new paragraph or in an empty composer), Gmail body (same three), plain textarea (empty, after "?", new line, after "("); GTK Text Editor and Tilix unchanged ✅ | ✅ TextEdit (empty field, after ".", after a space and "("; a later fix is still learned), Chrome (address bar, claude.ai rich editor: one space after text, none on an empty new line); cmux ✅ via the last-paste fallback (its terminal exposes no text, so no learning there) |
 | Silent recordings discarded, even with a hotkey click in them (`min-speech-seconds`) | ✅ real microphone (TONOR, Alt → Ctrl toggle): 5.5 s of silence with the hotkey clicks discarded (Voiced 0.24 s), "yes" kept (0.51 s), a sentence kept (1.41 s); test files ✅ (silence, noise, one or two clicks discarded; speech 30 dB quieter kept) | ⏳ real microphone (TONOR, Option → Control toggle): silence measured 0.00 s (discarded) and 0.30 s (kept: Whisper returned "." and it was pasted); "yes" kept (0.48 s), a sentence kept (1.02 s) |
@@ -226,10 +230,15 @@ stop and transcribe. It runs `xhisper --toggle`, which records until the next
 **Cancel:** press **Escape** while recording. The recording is discarded and
 `cancel-sound` plays.
 
-**History:** `xhisper --history` opens a window with your last dictations
-(newest first), each with a **Copy** button. The Recording and No sound pills
-also carry a **History** chip: clicking it while recording stops listening (like
-a cancel) and the pill slides into the history window. Kept: the last
+**History:** `xhisper --history` (on macOS also a double tap of the Option→Control hotkey) opens a window with your last dictations
+(newest first). **Copy** puts an entry on the clipboard; **Edit** turns it into
+a field you fix and save. On macOS, when a text field had the focus as the
+window opened, **Paste** closes the window and pastes the entry into that field
+(Enter does it for the highlighted entry, ↑/↓ move the highlight); there the
+actions show on hover, a saved edit confirms with a toast, and new dictations
+appear while the window is open. The Recording and No sound pills (on macOS
+also Failed and Cancelled) carry a **History** chip: clicking it while recording
+stops listening (like a cancel) and the pill slides into the history window. Kept: the last
 `history-size` dictations (default 20, `0` keeps none) in
 `~/.local/state/xhisper/history.jsonl`, readable only by you. **Edit** fixes a
 dictation in place and learns the words you corrected.
@@ -252,9 +261,9 @@ An animated wave pill overlay slides up from the bottom of your screen showing t
 - **Recording** — wave bars that follow your voice (with an optional `start-sound` cue), plus a **History** chip
 - **Transcribing** — gentler pulse while Whisper processes your audio
 - **Editing** — AI is cleaning up your text
-- **Done** — brief confirmation, then fades out
-- **No sound** / **Failed** — nothing was recorded, or a step failed; run `xhisper --log` for the details. No sound keeps the **History** chip, and stays up while your pointer is over it
-- **Cancelled** — you pressed Escape
+- **Done** — the pill fades out once the text is pasted
+- **No sound** / **Failed** — nothing was recorded, or a step failed; run `xhisper --log` for the details. No sound keeps the **History** chip and stays up while your pointer is over it (on macOS, Failed too)
+- **Cancelled** — you pressed Escape (on macOS with a **History** chip)
 - **Learned: WORD** — a correction you made taught xhisper a new word; click **Unlearn** to undo it
 
 ```sh

@@ -264,8 +264,8 @@ class WavePill(Gtk.Window if HAS_GTK else object):
         if self.launch_start is not None:
             return False
         # Never slide away from under the pointer: the user may be reaching
-        # for the History chip.
-        if self.pointer_inside:
+        # for the History chip. A finished dictation goes at once, hovered or not.
+        if self.pointer_inside and self.state not in UPDATABLE_STATES:
             GLib.timeout_add(400, self.start_close)
             return False
         self.closing = True

@@ -6,13 +6,16 @@ import Foundation
 // virtual key is the V position (kVK_ANSI_V), stable on QWERTY, AZERTY and
 // QWERTZ, and the text itself travels through the clipboard.
 enum Paste {
-    static func main(_ args: [String]) -> Int32 {
+    static func main(_ args: [String]) -> Int32 { keystroke(shift: args.contains("--shift")) }
+
+    /// 0 sent, 2 no Accessibility, 1 no event source.
+    static func keystroke(shift: Bool = false) -> Int32 {
         // Without Accessibility macOS drops posted events silently: say so.
         guard AXIsProcessTrusted() else { return 2 }
         guard let source = CGEventSource(stateID: .hidSystemState) else { return 1 }
         let v: CGKeyCode = 9  // kVK_ANSI_V
         var flags: CGEventFlags = .maskCommand
-        if args.contains("--shift") { flags.insert(.maskShift) }
+        if shift { flags.insert(.maskShift) }
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: v, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: v, keyDown: false) else { return 1 }
         down.flags = flags
