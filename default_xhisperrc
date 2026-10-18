@@ -36,6 +36,10 @@ max-recording-seconds    : 300
 # on the overlay (0 = keep none). Stored 0600 in ~/.local/state/xhisper/.
 history-size             : 20
 
+# Linux: size of the History window and its text, 1 = the design's pixels.
+# Empty follows GNOME's text scaling (1.25 with Large Text), like other apps.
+history-scale            :
+
 # Learning:
 # After each paste, follow the text field for a minute (AT-SPI on Linux, the
 # Accessibility API on macOS) and learn the words you correct in it - e.g. fix "to Ziam" into

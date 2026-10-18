@@ -118,6 +118,25 @@ except (ImportError, ValueError):
     GdkX11 = None
 
 
+def ui_scale():
+    """How much bigger than the design's pixels to draw. The design's numbers
+    are macOS points; GNOME's text scaling (Settings > Accessibility > Large
+    Text, or Tweaks' scaling factor) shows up as the Xft DPI over 96, and
+    every other app's text follows it (user, 2026-10-18: "too small" at 1.25
+    on a 4K screen at scale 1). `history-scale` in xhisperrc overrides it."""
+    try:
+        forced = float(config_value("history-scale") or 0)
+    except ValueError:
+        forced = 0
+    if forced > 0:
+        return max(0.75, min(3.0, forced))
+    try:
+        dpi = Gtk.Settings.get_default().props.gtk_xft_dpi / 1024
+    except Exception:
+        dpi = 0
+    return max(1.0, min(3.0, dpi / 96)) if dpi > 0 else 1.0
+
+
 # ----- Design tokens (macos/History.swift HistoryStyle, A9 §2-3) -------------
 
 INK = "#EDE8D9"                         # ink.primary 237,232,217
@@ -127,7 +146,15 @@ SUCCESS = "rgb(150,200,140)"
 ERROR = "rgb(232,115,102)"
 SURFACE = (26 / 255, 26 / 255, 26 / 255, 0.97)  # 0.90 over a blur on macOS; X11 has no blur
 EDGE = (1, 1, 1, 0.08)
-RADIUS = 19                    # the pill's end radius
+SCALE = 1.0  # set by main() from ui_scale(): needs the config reader and GTK
+
+
+def px(n):
+    """A design size (macOS points) in pixels at the window's scale."""
+    return int(round(n * SCALE))
+
+
+RADIUS = 19                    # the pill's end radius (design units; px() at use)
 SHADOW = 24                    # room for the window's own shadow (no WM shadow when undecorated)
 DEFAULT_SIZE = (440, 520)
 MIN_SIZE = (360, 260)
@@ -215,6 +242,13 @@ CSS = """
 #xhisper-history scrollbar slider { background-color: rgba(255,255,255,0.32); border: none;
     min-width: 6px; border-radius: 3px; }
 """ % {"ink": INK, "label": INK_LABEL, "secondary": INK_SECONDARY, "success": SUCCESS, "error": ERROR}
+
+
+def scaled_css():
+    """The stylesheet with every pixel size at the window's scale (1 px
+    borders and hairlines stay 1 px)."""
+    return re.sub(r"(\d+(?:\.\d+)?)px", lambda m: "%dpx" % max(1, px(float(m.group(1))))
+                  if float(m.group(1)) > 1 else m.group(0), CSS)
 
 
 # ----- Motion ----------------------------------------------------------------
@@ -427,16 +461,28 @@ def arrival(shown, file):
     return ("rebuild",)
 
 
-def history_size():
+def config_value(key):
+    """One `key : value` from xhisperrc (whitespace, quotes and a trailing
+    ' # comment' stripped, as xhisper.sh reads it), or None."""
     try:
         with open(os.path.join(CONFIG_DIR, "xhisperrc"), encoding="utf-8") as f:
             for line in f:
                 name, sep, value = line.partition(":")
-                if sep and name.strip() == "history-size":
-                    return int(value.split(" #", 1)[0].strip().strip("'\""))
-    except (OSError, ValueError):
+                if sep and name.strip() == key:
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                        return value[1:-1]
+                    return value.split(" #", 1)[0].strip()
+    except OSError:
         pass
-    return 20
+    return None
+
+
+def history_size():
+    try:
+        return int(config_value("history-size") or 20)
+    except ValueError:
+        return 20
 
 
 # ----- Helpers outside GTK ---------------------------------------------------
@@ -567,13 +613,15 @@ def label(text, *classes, xalign=0.0):
 
 def icon(name, size):
     image = Gtk.Image.new_from_icon_name(name, Gtk.IconSize.MENU)
-    image.set_pixel_size(size)
+    image.set_pixel_size(px(size))
     return image
 
 
 def bars_widget(heights, width, gap, radius, rgba, box_height):
     """Rounded bars like the pill's: the header mark and the empty state."""
     area = Gtk.DrawingArea()
+    heights = [h * SCALE for h in heights]
+    width, gap, radius, box_height = width * SCALE, gap * SCALE, radius * SCALE, px(box_height)
     area.set_size_request(int(round(len(heights) * width + (len(heights) - 1) * gap)), box_height)
     area.set_valign(Gtk.Align.CENTER)
 
@@ -613,20 +661,20 @@ class RowButton(Gtk.Button):
             self.set_tooltip_text(tooltip)
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
                                transition_duration=160, interpolate_size=True, hhomogeneous=False)
-        self.rest = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+        self.rest = Gtk.Box(spacing=px(6), halign=Gtk.Align.CENTER)
         if icon_name:
             self.rest.pack_start(icon(icon_name, 14), False, False, 0)
-            self.set_size_request(28, 28)
+            self.set_size_request(px(28), px(28))
         else:
-            self.rest.set_margin_start(12)
-            self.rest.set_margin_end(12)
+            self.rest.set_margin_start(px(12))
+            self.rest.set_margin_end(px(12))
             self.rest.pack_start(label(text), False, False, 0)
         self.glyph = label("↩", "glyph")
         self.glyph.set_no_show_all(True)
         self.rest.pack_start(self.glyph, False, False, 0)
-        copied = Gtk.Box(spacing=5)
-        copied.set_margin_start(9 if icon_name else 10)
-        copied.set_margin_end(11 if icon_name else 12)
+        copied = Gtk.Box(spacing=px(5))
+        copied.set_margin_start(px(9 if icon_name else 10))
+        copied.set_margin_end(px(11 if icon_name else 12))
         copied.pack_start(icon("object-select-symbolic", 12), False, False, 0)
         copied.pack_start(label("Copied"), False, False, 0)
         self.stack.add_named(self.rest, "rest")
@@ -685,13 +733,13 @@ class Row(Gtk.EventBox):
         self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.box.get_style_context().add_class("row")
         self.add(self.box)
-        meta = Gtk.Box(spacing=4)
-        meta.set_size_request(-1, 28)
+        meta = Gtk.Box(spacing=px(4))
+        meta.set_size_request(-1, px(28))
         self.time = label("", "time")
         self.time.set_ellipsize(Pango.EllipsizeMode.END)
         self.time.set_valign(Gtk.Align.CENTER)
         meta.pack_start(self.time, True, True, 0)
-        self.actions = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+        self.actions = Gtk.Box(spacing=px(4), valign=Gtk.Align.CENTER)
         self.actions.set_opacity(0)
         meta.pack_end(self.actions, False, False, 0)
         self.box.pack_start(meta, False, False, 0)
@@ -700,7 +748,7 @@ class Row(Gtk.EventBox):
         self.text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
         self.text.set_ellipsize(Pango.EllipsizeMode.END)
         self.text.get_style_context().add_class("entry")
-        self.text.set_margin_top(2)
+        self.text.set_margin_top(px(2))
         self.text.set_can_focus(False)
         self.text.connect("size-allocate", self.on_text_allocate)
         # RTL (A9): the whole entry reads right to left. Measured: the label's
@@ -715,7 +763,7 @@ class Row(Gtk.EventBox):
         self.more.set_relief(Gtk.ReliefStyle.NONE)
         self.more.get_style_context().add_class("more")
         self.more.set_halign(Gtk.Align.START)
-        more_box = Gtk.Box(spacing=3)
+        more_box = Gtk.Box(spacing=px(3))
         self.more_label = label("Show more")
         self.more_icon = icon("pan-down-symbolic", 10)
         more_box.pack_start(self.more_label, False, False, 0)
@@ -887,7 +935,7 @@ class Row(Gtk.EventBox):
         self.set_actions(buttons)
         self.text.hide()
         self.more.hide()
-        field.set_margin_top(2)
+        field.set_margin_top(px(2))
         self.box.pack_start(field, False, False, 0)
         field.show_all()
         self.refresh(True)
@@ -940,18 +988,18 @@ class EditField(Gtk.Box):
         super().__init__()
         self.get_style_context().add_class("field")
         self.view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, accepts_tab=False)
-        self.view.set_left_margin(9)
-        self.view.set_right_margin(9)
-        self.view.set_top_margin(7)
-        self.view.set_bottom_margin(7)
+        self.view.set_left_margin(px(9))
+        self.view.set_right_margin(px(9))
+        self.view.set_top_margin(px(7))
+        self.view.set_bottom_margin(px(7))
         self.view.set_pixels_inside_wrap(1)
         self.view.get_buffer().set_text(text)
         if is_rtl(text):
             self.view.set_direction(Gtk.TextDirection.RTL)
         scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroll.set_propagate_natural_height(True)
-        scroll.set_min_content_height(2 * LINE_HEIGHT + 14)
-        scroll.set_max_content_height(10 * LINE_HEIGHT + 14)
+        scroll.set_min_content_height(px(2 * LINE_HEIGHT + 14))
+        scroll.set_max_content_height(px(10 * LINE_HEIGHT + 14))
         scroll.add(self.view)
         self.pack_start(scroll, True, True, 0)
         buf = self.view.get_buffer()
@@ -986,7 +1034,7 @@ class HistoryWindow(Gtk.ApplicationWindow):
         if visual is not None:
             self.set_visual(visual)
         self.reduce = reduce_motion()
-        self.margin = SHADOW if self.composited else 0
+        self.margin = px(SHADOW) if self.composited else 0
 
         self.entries = []
         self.rows = []
@@ -1054,12 +1102,12 @@ class HistoryWindow(Gtk.ApplicationWindow):
         header.connect("button-press-event", self.on_header_press)
         header.connect("motion-notify-event", self.on_edge_motion)
         hbox = Gtk.Box()
-        hbox.set_size_request(-1, 44)
+        hbox.set_size_request(-1, px(44))
         mark = bars_widget([5, 9, 14, 8, 11], 2, 1.5, 1, ink_rgba(1), 14)
-        mark.set_margin_start(16)
+        mark.set_margin_start(px(16))
         hbox.pack_start(mark, False, False, 0)
         title = label("History", "title")
-        title.set_margin_start(7)
+        title.set_margin_start(px(7))
         hbox.pack_start(title, False, False, 0)
         close = Gtk.Button()
         close.set_can_focus(False)
@@ -1068,7 +1116,7 @@ class HistoryWindow(Gtk.ApplicationWindow):
         close.set_tooltip_text("Close (esc)")
         close.add(icon("window-close-symbolic", 10))
         close.set_valign(Gtk.Align.CENTER)
-        close.set_margin_end(10 - 2)
+        close.set_margin_end(px(10 - 2))
         close.connect("clicked", lambda *_: self.close_animated())
         hbox.pack_end(close, False, False, 0)
         header.add(hbox)
@@ -1082,12 +1130,12 @@ class HistoryWindow(Gtk.ApplicationWindow):
         self.stack = Gtk.Stack()
         self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         self.scroll.set_overlay_scrolling(True)
-        self.scroll.set_margin_start(GRAB)
-        self.scroll.set_margin_end(GRAB)
-        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.list.set_margin_start(8 - GRAB)
-        self.list.set_margin_end(8 - GRAB)
-        self.list.set_margin_bottom(8)
+        self.scroll.set_margin_start(px(GRAB))
+        self.scroll.set_margin_end(px(GRAB))
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=px(4))
+        self.list.set_margin_start(px(8) - px(GRAB))
+        self.list.set_margin_end(px(8) - px(GRAB))
+        self.list.set_margin_bottom(px(8))
         self.list.set_valign(Gtk.Align.START)
         self.scroll.add(self.list)
         self.vadj = self.scroll.get_vadjustment()
@@ -1105,11 +1153,11 @@ class HistoryWindow(Gtk.ApplicationWindow):
         footer.connect("button-press-event", self.on_footer_press)
         footer.connect("motion-notify-event", self.on_edge_motion)
         fbox = Gtk.Box()
-        fbox.set_size_request(-1, 31)
-        self.hints = Gtk.Box(spacing=16)
-        self.hints.set_margin_start(16)
-        self.trailing_hint = Gtk.Box(spacing=16)
-        self.trailing_hint.set_margin_end(16)
+        fbox.set_size_request(-1, px(32) - 1)
+        self.hints = Gtk.Box(spacing=px(16))
+        self.hints.set_margin_start(px(16))
+        self.trailing_hint = Gtk.Box(spacing=px(16))
+        self.trailing_hint.set_margin_end(px(16))
         fbox.pack_start(self.hints, False, False, 0)
         fbox.pack_end(self.trailing_hint, False, False, 0)
         footer.add(fbox)
@@ -1119,7 +1167,7 @@ class HistoryWindow(Gtk.ApplicationWindow):
         self.new_chip = Gtk.Button()
         self.new_chip.set_can_focus(False)
         self.new_chip.get_style_context().add_class("newchip")
-        chip_box = Gtk.Box(spacing=4)
+        chip_box = Gtk.Box(spacing=px(4))
         chip_box.pack_start(icon("go-up-symbolic", 10), False, False, 0)
         self.new_chip_label = label("")
         chip_box.pack_start(self.new_chip_label, False, False, 0)
@@ -1127,25 +1175,25 @@ class HistoryWindow(Gtk.ApplicationWindow):
         self.new_chip.set_tooltip_text("Scroll to the newest")
         self.new_chip.set_halign(Gtk.Align.CENTER)
         self.new_chip.set_valign(Gtk.Align.START)
-        self.new_chip.set_margin_top(44 + 8)
+        self.new_chip.set_margin_top(px(44 + 8))
         self.new_chip.connect("clicked", lambda *_: self.scroll_to_top())
         self.new_chip.set_no_show_all(True)
         overlay.add_overlay(self.new_chip)
 
         # Toasts, 12 above the footer.
         self.toast_slot = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.END)
-        self.toast_slot.set_margin_bottom(32 + 12)
+        self.toast_slot.set_margin_bottom(px(32 + 12))
         overlay.add_overlay(self.toast_slot)
         overlay.set_overlay_pass_through(self.toast_slot, False)
 
     def make_empty(self):
         """A6: seven bars, title, one line of help; centred, raised 22."""
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=px(6),
                       halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-        box.set_margin_bottom(44)
+        box.set_margin_bottom(px(44))
         bars = bars_widget([6, 10, 15, 20, 15, 10, 6], 4, 3, 2, ink_rgba(0.35), 28)
         bars.set_halign(Gtk.Align.CENTER)
-        bars.set_margin_bottom(8)
+        bars.set_margin_bottom(px(8))
         box.pack_start(bars, False, False, 0)
         box.pack_start(label("No dictations yet", "empty-title", xalign=0.5), False, False, 0)
         body = label("Hold your dictation hotkey and speak. Your last %d dictations will show up here."
@@ -1174,13 +1222,13 @@ class HistoryWindow(Gtk.ApplicationWindow):
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
         x, y, w, h = self.card_rect()
-        r = RADIUS if self.composited else 0
+        r = px(RADIUS) if self.composited else 0
         if self.composited:
             # The window's shadow (0 12 32 black 0.45 on macOS), as stacked outlines.
             steps = 16
             for k in range(steps):
-                spread = SHADOW * (1 - k / steps)
-                self.rounded(cr, x - spread / 2, y + 8 - spread / 2, w + spread, h + spread, r + spread / 2)
+                spread = self.margin * (1 - k / steps)
+                self.rounded(cr, x - spread / 2, y + px(8) - spread / 2, w + spread, h + spread, r + spread / 2)
                 cr.set_source_rgba(0, 0, 0, 0.45 / steps * 1.4)
                 cr.fill()
         self.rounded(cr, x, y, w, h, r)
@@ -1235,19 +1283,20 @@ class HistoryWindow(Gtk.ApplicationWindow):
         """The resize edge under a window point (6 px bands inside the card,
         corners 19 long), as a Gdk.WindowEdge, or None."""
         x, y, w, h = self.card_rect()
-        px, py = wx - x, wy - y
-        if px < 0 or py < 0 or px > w or py > h:
+        x_, y_ = wx - x, wy - y
+        if x_ < 0 or y_ < 0 or x_ > w or y_ > h:
             return None
-        left, right, top, bottom = px < GRAB, px > w - GRAB, py < GRAB, py > h - GRAB
+        grab, span = px(GRAB), px(CORNER_SPAN)
+        left, right, top, bottom = x_ < grab, x_ > w - grab, y_ < grab, y_ > h - grab
         if left or right:
-            if py < CORNER_SPAN:
+            if y_ < span:
                 top = True
-            elif py > h - CORNER_SPAN:
+            elif y_ > h - span:
                 bottom = True
         if top or bottom:
-            if px < CORNER_SPAN:
+            if x_ < span:
                 left = True
-            elif px > w - CORNER_SPAN:
+            elif x_ > w - span:
                 right = True
         E = Gdk.WindowEdge
         table = {(True, False, True, False): E.NORTH_WEST, (False, True, True, False): E.NORTH_EAST,
@@ -1393,7 +1442,7 @@ class HistoryWindow(Gtk.ApplicationWindow):
 
     @staticmethod
     def hint(key, text):
-        box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        box = Gtk.Box(spacing=px(6), valign=Gtk.Align.CENTER)
         cap = label(key, "keycap", xalign=0.5)
         cap.set_valign(Gtk.Align.CENTER)
         box.pack_start(cap, False, False, 0)
@@ -1485,11 +1534,11 @@ class HistoryWindow(Gtk.ApplicationWindow):
             return
         self.new_chip_shown = True
         self.new_chip.show_all()
-        rise = 0 if self.reduce else 4
+        rise = 0 if self.reduce else px(4)
 
         def step(e):
             self.new_chip.set_opacity(e)
-            self.new_chip.set_margin_top(int(44 + 8 - rise * (1 - e)))
+            self.new_chip.set_margin_top(int(px(44 + 8) - rise * (1 - e)))
         Tween(0.16, CURVE_OUT, step)
 
     def hide_new_chip(self):
@@ -1773,7 +1822,7 @@ class HistoryWindow(Gtk.ApplicationWindow):
         self.dismiss_toast(animated=False)
         esc = GLib.markup_escape_text
         listed = ", ".join('<span weight="600" foreground="%s">%s</span>' % (INK, esc(w)) for w in words)
-        box = Gtk.Box(spacing=8)
+        box = Gtk.Box(spacing=px(8))
         box.get_style_context().add_class("toast")
         chip = None
         if kind in ("saved", "learned"):
@@ -1814,11 +1863,11 @@ class HistoryWindow(Gtk.ApplicationWindow):
         self.toast_slot.pack_start(holder, False, False, 0)
         holder.show_all()
         self.toast, self.toast_kind = holder, kind
-        rise = 0 if self.reduce else 8
+        rise = 0 if self.reduce else px(8)
 
         def step(e):
             holder.set_opacity(e)
-            self.toast_slot.set_margin_bottom(int(32 + 12 - rise * (1 - e)))
+            self.toast_slot.set_margin_bottom(int(px(32 + 12) - rise * (1 - e)))
         Tween(0.2, CURVE_OUT, step)
         self.hold_toast({"saved": 1.8, "unlearned": 1.8, "learned": 3.5, "failed": 6}[kind])
 
@@ -1870,8 +1919,8 @@ class HistoryWindow(Gtk.ApplicationWindow):
         display = Gdk.Display.get_default()
         monitor = None
         try:
-            _screen, px, py = display.get_default_seat().get_pointer().get_position()[:3]
-            monitor = display.get_monitor_at_point(px, py)
+            _screen, x, y = display.get_default_seat().get_pointer().get_position()[:3]
+            monitor = display.get_monitor_at_point(x, y)
         except Exception:
             pass
         monitor = monitor or display.get_primary_monitor() or display.get_monitor(0)
@@ -1881,16 +1930,16 @@ class HistoryWindow(Gtk.ApplicationWindow):
         try:
             with open(SIZE_FILE) as f:
                 w, h = json.load(f)
-            return int(w), int(h)
+            return px(float(w)), px(float(h))
         except (OSError, ValueError, TypeError):
-            return DEFAULT_SIZE
+            return px(DEFAULT_SIZE[0]), px(DEFAULT_SIZE[1])
 
     def save_size(self):
         x, y, w, h = self.card_rect()
         try:
             os.makedirs(os.path.dirname(SIZE_FILE), exist_ok=True)
             with open(SIZE_FILE, "w") as f:
-                json.dump([w, h], f)
+                json.dump([round(w / SCALE, 1), round(h / SCALE, 1)], f)  # design units
         except OSError:
             pass
 
@@ -1899,14 +1948,15 @@ class HistoryWindow(Gtk.ApplicationWindow):
         area = self.monitor_area()
         max_w, max_h = area.width - 2 * SCREEN_MARGIN, area.height - HEIGHT_RESERVE
         w, h = self.saved_size()
-        w = max(MIN_SIZE[0], min(max_w, w))
-        h = max(MIN_SIZE[1], min(max_h, h))
+        min_w, min_h = px(MIN_SIZE[0]), px(MIN_SIZE[1])
+        w = max(min_w, min(max_w, w))
+        h = max(min_h, min(max_h, h))
         x = area.x + (area.width - w) // 2
         y = area.y + area.height - BOTTOM_GAP - h
         x = max(area.x + SCREEN_MARGIN, min(area.x + area.width - SCREEN_MARGIN - w, x))
         y = max(area.y + SCREEN_MARGIN, min(area.y + area.height - SCREEN_MARGIN - h, y))
         geometry = Gdk.Geometry()
-        geometry.min_width, geometry.min_height = MIN_SIZE[0] + 2 * self.margin, MIN_SIZE[1] + 2 * self.margin
+        geometry.min_width, geometry.min_height = min_w + 2 * self.margin, min_h + 2 * self.margin
         geometry.max_width, geometry.max_height = max_w + 2 * self.margin, max_h + 2 * self.margin
         self.set_geometry_hints(None, geometry, Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE)
         return x - self.margin, y - self.margin, w + 2 * self.margin, h + 2 * self.margin
@@ -1939,7 +1989,7 @@ class HistoryWindow(Gtk.ApplicationWindow):
     def present_animated(self):
         """Open (A8): 220 ms after 40, curve out; rise 24 and fade in."""
         x, y, w, h = self.frame()
-        rise = 0 if self.reduce else 24
+        rise = 0 if self.reduce else px(24)
         self.resize(w, h)
         self.move(x, y + rise)
         self.set_opacity(0)
@@ -2020,7 +2070,7 @@ class HistoryWindow(Gtk.ApplicationWindow):
             self.motion.stop()
         pos = self.get_position()
         alpha = self.get_opacity()
-        drop = 0 if self.reduce else 12
+        drop = 0 if self.reduce else px(12)
         had_keys = self.is_active()
 
         def step(e):
@@ -2121,7 +2171,7 @@ class HistoryApp(Gtk.Application):
         # Selectable labels would otherwise select all their text when focused.
         settings.set_property("gtk-label-select-on-focus", False)
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS.encode("utf-8"))
+        provider.load_from_data(scaled_css().encode("utf-8"))
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.probe = Probe(LAUNCH_TARGET)
@@ -2187,4 +2237,5 @@ class HistoryApp(Gtk.Application):
 
 
 if __name__ == "__main__":
+    SCALE = ui_scale()
     sys.exit(HistoryApp().run(sys.argv))
