@@ -169,7 +169,9 @@ bar's tray: click it to start dictating, click again to stop. The mark turns
 coral while recording and dims while the text is transcribed and pasted.
 **Middle-click** it (or right-click → *Stop and send (Enter)*) to stop and press
 Enter after the paste, which sends a chat message or a Claude Code prompt
-(`xhisper --send` does the same from a script). Right-click also opens History.
+(`xhisper --send` does the same from a script). Tick *Send with Enter every
+time* in the right-click menu to make every stop from the button send. Right-click
+also opens History.
 
 ```sh
 cp xhisper-tray.desktop ~/.config/autostart/

@@ -4,7 +4,9 @@
 Click it to start dictating, click it again to stop: each click runs
 `xhisper --toggle`, like the Alt then Ctrl hotkey. Middle-click to stop and
 send: `xhisper --send` presses Enter after the paste (a chat message, a Claude
-Code prompt). Right click for a menu (Stop and send, History, Quit).
+Code prompt). Right click for a menu (Stop and send, History, Quit) and the
+"Send with Enter every time" checkbox: then a plain click that stops a
+recording sends it as well (kept in $XDG_STATE_HOME/xhisper/tray.json).
 
 Not a double click: GNOME's microphone indicator appears in the top bar while
 recording and vanishes on the stop, shifting the tray icons under the pointer,
@@ -24,6 +26,7 @@ per session (flock on the runtime dir).
 """
 
 import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -48,6 +51,8 @@ RUNTIME_DIR = os.environ.get("XHISPER_RUNTIME_DIR") or os.path.join(
     os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "xhisper")
 PIPELINE_PID_FILE = os.path.join(RUNTIME_DIR, "xhisper.pid")
 RECORDING = os.path.join(RUNTIME_DIR, "xhisper.wav")
+SETTINGS_FILE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                             "xhisper", "tray.json")
 POLL_MS = 200
 CLICK_GUARD_SECONDS = 0.35  # a double click is one action, never start + stop
 
@@ -90,6 +95,26 @@ def pipeline_live():
         return False
 
 
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(settings, f)
+        os.replace(tmp, SETTINGS_FILE)
+    except OSError as e:
+        print("xhisper-tray: cannot save settings: %s" % e, file=sys.stderr)
+
+
 def current_state():
     """idle, recording (the WAV still grows) or working (transcribing, pasting)."""
     if not pipeline_live():
@@ -125,7 +150,8 @@ def draw_icon(size, state):
 
 TOOLTIPS = {
     "idle": "xhisper: click to dictate",
-    "recording": "xhisper: recording, click to stop",
+    "recording": "xhisper: recording, click to stop (middle click: stop and send)",
+    "recording-send": "xhisper: recording, click to stop and send",
     "working": "xhisper: transcribing",
 }
 
@@ -139,6 +165,7 @@ class Tray:
         self.size = 22
         self.last_click = 0.0
         self.last_window = None  # XID of the last real window with the focus
+        self.send_always = bool(load_settings().get("send_always"))
         self.icon.connect("activate", self.on_click)
         self.icon.connect("popup-menu", self.on_menu)
         self.icon.connect("button-press-event", self.on_button)
@@ -170,8 +197,19 @@ class Tray:
         if state != self.state:
             self.state = state
             self.icon.set_from_pixbuf(draw_icon(self.size, state))
-            self.icon.set_tooltip_text(TOOLTIPS[state])
+            self.update_tooltip()
         return True
+
+    def update_tooltip(self):
+        key = "recording-send" if (self.state == "recording" and self.send_always) else self.state
+        self.icon.set_tooltip_text(TOOLTIPS[key])
+
+    def set_send_always(self, on):
+        self.send_always = on
+        settings = load_settings()
+        settings["send_always"] = on
+        save_settings(settings)
+        self.update_tooltip()
 
     def run(self, args):
         try:
@@ -185,8 +223,11 @@ class Tray:
         if now - self.last_click < CLICK_GUARD_SECONDS:
             return  # a double click: one toggle, never start then stop
         self.last_click = now
-        self.restore_focus()
-        self.run([xhisper_command(), "--toggle"])
+        if self.send_always and pipeline_live():
+            self.send(_icon)  # this click stops: send it too
+        else:
+            self.restore_focus()
+            self.run([xhisper_command(), "--toggle"])
         # Show the change at once; the poll confirms it.
         GLib.timeout_add(150, lambda: self.refresh() and False)
 
@@ -221,11 +262,14 @@ class Tray:
         send = Gtk.MenuItem(label="Stop and send (Enter)")
         send.set_sensitive(live)
         send.connect("activate", lambda *_: self.send(icon))
+        always = Gtk.CheckMenuItem(label="Send with Enter every time")
+        always.set_active(self.send_always)
+        always.connect("toggled", lambda item: self.set_send_always(item.get_active()))
         history = Gtk.MenuItem(label="History")
         history.connect("activate", lambda *_: self.run([sibling("xhisper-history")]))
         quit_item = Gtk.MenuItem(label="Quit tray button")
         quit_item.connect("activate", lambda *_: Gtk.main_quit())
-        for item in (toggle, send, history, Gtk.SeparatorMenuItem(), quit_item):
+        for item in (toggle, send, always, Gtk.SeparatorMenuItem(), history, Gtk.SeparatorMenuItem(), quit_item):
             menu.append(item)
         menu.show_all()
         self.menu = menu  # keep it alive while it is shown
