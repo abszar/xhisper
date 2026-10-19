@@ -11,6 +11,10 @@ ifeq ($(UNAME),Darwin)
 APP = build/Xhisper.app
 APP_BIN = $(APP)/Contents/MacOS/Xhisper
 APP_SOURCES = $(wildcard macos/*.swift)
+# MediaRemote (pause-media) must run inside Apple-signed perl, so it is a
+# separate library the app hands to /usr/bin/perl. See macos/media/.
+MEDIA_SOURCES = macos/media/XhisperMedia.swift
+MEDIA_LIB = $(APP)/Contents/Frameworks/libXhisperMedia.dylib
 LOGIC_SOURCES = macos/Runtime.swift macos/LevelMeter.swift macos/HistoryStore.swift macos/HistoryLayout.swift macos/PillLayout.swift macos/HotkeyLogic.swift
 SWIFTFLAGS = -O -swift-version 5 -target $(shell uname -m)-apple-macos13.0
 # A stable signature keeps the Accessibility / Input Monitoring grants across
@@ -23,9 +27,11 @@ APPLICATIONS = $(DESTDIR)/Applications
 
 all: $(APP_BIN)
 
-$(APP_BIN): $(APP_SOURCES) macos/Info.plist
-	mkdir -p $(APP)/Contents/MacOS
+$(APP_BIN): $(APP_SOURCES) $(MEDIA_SOURCES) macos/Info.plist
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Frameworks
 	cp macos/Info.plist $(APP)/Contents/Info.plist
+	swiftc $(SWIFTFLAGS) -emit-library -module-name XhisperMedia $(MEDIA_SOURCES) -o $(MEDIA_LIB)
+	codesign --force --sign "$(SIGN_ID)" $(MEDIA_LIB)
 	swiftc $(SWIFTFLAGS) $(APP_SOURCES) -o $(APP_BIN)
 	codesign --force --sign "$(SIGN_ID)" --identifier io.github.abszar.xhisper $(APP)
 
@@ -40,7 +46,7 @@ check: build/selftest
 # Never builds: under sudo that would ad-hoc sign as root (TCC grants dropped,
 # root-owned build/). Build first as your user with plain `make`.
 install:
-	@if [ ! -f $(APP_BIN) ] || [ -n "$$(find $(APP_SOURCES) macos/Info.plist -newer $(APP_BIN) 2>/dev/null)" ]; then \
+	@if [ ! -f $(APP_BIN) ] || [ -n "$$(find $(APP_SOURCES) $(MEDIA_SOURCES) macos/Info.plist -newer $(APP_BIN) 2>/dev/null)" ]; then \
 	  echo "Run 'make' as your user first (signing needs your keychain)"; exit 1; fi
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 xhisper.sh $(DESTDIR)$(BINDIR)/xhisper

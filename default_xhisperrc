@@ -31,6 +31,12 @@ max-recording-seconds    : 300
 # cancel-sound  : /System/Library/Sounds/Basso.aiff
 # learned-sound : /System/Library/Sounds/Glass.aiff   # with the "Learned: WORD" pill (see learn-words)
 
+# Pause media (like SuperWhisper): a video or song playing in the background
+# (YouTube in the browser, Music, Spotify, a podcast) is paused when the
+# recording starts and resumed the moment it stops. macOS: whatever the system
+# shows as Now Playing; Linux: every MPRIS player that was playing (playerctl).
+pause-media              : true
+
 # History:
 # Number of past dictations kept for 'xhisper --history' and the History chip
 # on the overlay (0 = keep none). Stored 0600 in ~/.local/state/xhisper/.

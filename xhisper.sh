@@ -58,6 +58,8 @@ PIDFILE="$RUNTIME_DIR/xhisper.pid"
 STOPFILE="$RUNTIME_DIR/xhisper.stop"
 HISTORYFLAG="$RUNTIME_DIR/xhisper.history"
 SUBMITFILE="$RUNTIME_DIR/xhisper.submit"
+# Exists while a player we paused (pause-media) waits to be resumed.
+MEDIA_FILE="$RUNTIME_DIR/xhisper.media"
 CONTEXT_FILE="$RUNTIME_DIR/screen-context.txt"
 BEFORE_FILE="$RUNTIME_DIR/caret-before.txt"
 LLM_REQUEST="$RUNTIME_DIR/llm-request.json"
@@ -217,6 +219,7 @@ history_size=20
 learn_words="false"
 screen_context="false"
 smart_spacing="true"
+pause_media="true"
 stt_url="https://api.groq.com/openai/v1"
 stt_api_key=""
 stt_model=""
@@ -275,6 +278,7 @@ if [ -f "$CONFIG_FILE" ]; then
       learn-words) learn_words="$value" ;;
       screen-context) screen_context="$value" ;;
       smart-spacing) smart_spacing="$value" ;;
+      pause-media) pause_media="$value" ;;
       stt-url) stt_url="$value" ;;
       stt-api-key) stt_api_key="$value" ;;
       stt-model) stt_model="$value" ;;
@@ -356,7 +360,7 @@ if [ -f "$PIDFILE" ]; then
   fi
   rm -f "$PIDFILE"
 fi
-rm -f "$STOPFILE" "$HISTORYFLAG" "$SUBMITFILE"
+rm -f "$STOPFILE" "$HISTORYFLAG" "$SUBMITFILE" "$MEDIA_FILE"
 printf '%s %s\n' "$$" "$(date +%s)" > "$PIDFILE"
 # A new dictation ends the correction watcher of the previous one.
 if [ -f "$RUNTIME_DIR/xhisper-learn.pid" ]; then
@@ -513,6 +517,54 @@ play_sound() {
   else
     pw-play "$1" < /dev/null > /dev/null 2>&1 &
   fi
+}
+
+# Pause the video or music playing in the background while recording
+# (pause-media), resume it once the recorder stops. macOS: `Xhisper media`,
+# which pauses whatever the system shows as Now Playing (a YouTube tab, Music,
+# Spotify...). Linux: every MPRIS player that is Playing, through playerctl.
+# $MEDIA_FILE exists while something we paused waits to be resumed: on macOS
+# it holds "nowplaying", on Linux one player name per line. Never the title.
+pause_media() {
+  [ "$pause_media" = "true" ] || return 0
+  if [ "$OS" = "Darwin" ]; then
+    [ -x "$XHISPER_APP" ] || return 0
+    # "unconfirmed" counts as paused: it was playing and a pause was sent
+    # twice, so a play afterwards is still right.
+    case "$("$XHISPER_APP" media pause 2>> "$LOGFILE")" in
+      paused|unconfirmed) printf 'nowplaying\n' > "$MEDIA_FILE" ;;
+    esac
+  elif command -v playerctl > /dev/null; then
+    local player
+    for player in $(playerctl -l 2>/dev/null); do
+      [ "$(playerctl -p "$player" status 2>/dev/null)" = "Playing" ] || continue
+      playerctl -p "$player" pause 2>/dev/null && printf '%s\n' "$player" >> "$MEDIA_FILE"
+    done
+  fi
+  return 0
+}
+
+# Resume what pause_media paused, once. pause_media runs in the background
+# beside the recorder, so wait for it first: a tap shorter than its answer
+# would otherwise leave the player paused.
+MEDIA_PID=""
+MEDIA_RESUMED=0
+resume_media() {
+  [ -n "$MEDIA_PID" ] && wait "$MEDIA_PID" 2>/dev/null
+  MEDIA_PID=""
+  [ -f "$MEDIA_FILE" ] || return 0
+  if [ "$OS" = "Darwin" ]; then
+    # In the background: confirming the play takes ~150 ms, which must not
+    # delay the upload or the paste. It outlives this script if it has to.
+    "$XHISPER_APP" media play < /dev/null > /dev/null 2>> "$LOGFILE" &
+  else
+    local player
+    while read -r player; do
+      playerctl -p "$player" play 2>/dev/null
+    done < "$MEDIA_FILE"
+  fi
+  rm -f "$MEDIA_FILE"
+  MEDIA_RESUMED=1
 }
 
 # Append one dictation to the history and keep only the last history_size.
@@ -1199,6 +1251,8 @@ cleanup() {
   [ "$CLEANED_UP" -eq 1 ] && return
   CLEANED_UP=1
   pkill -f "$PROCESS_PATTERN" 2>/dev/null
+  # A run that died while recording must not leave the player paused.
+  resume_media
   # An upload still running is one nobody will read (silent clip, early
   # failure): stop it rather than spend an API call on it.
   [ -n "$TRANSCRIBE_PID" ] && kill_tree "$TRANSCRIBE_PID"
@@ -1286,6 +1340,13 @@ else
 fi
 REC_PID=$!
 
+# Pause the video or music playing in the background (pause-media). Beside the
+# recorder, not before it: its round trip must not delay the capture.
+if [ "$pause_media" = "true" ]; then
+  pause_media > /dev/null 2>&1 &
+  MEDIA_PID=$!
+fi
+
 # Start the uinput daemon without waiting for it: it is only needed at paste
 # time, seconds from now, so its startup must not delay the recording or push
 # back the key-release snapshot.
@@ -1311,6 +1372,10 @@ STOP_TIME=$(now_seconds)
 kill $REC_PID 2>/dev/null
 wait $REC_PID 2>/dev/null
 
+# The recording is over: let the video or music play on, before anything else
+# (sounds, upload). Cancelled runs resume too.
+resume_media
+
 if [ "$KEY_RC" -eq 3 ]; then
   if [ "$OS" = "Darwin" ]; then
     fail "cannot read the keyboard — CoreGraphics is unavailable (see 'xhisper --log')"
@@ -1323,6 +1388,7 @@ fi
 if [ "$KEY_RC" -eq 4 ] || [ "$KEY_RC" -eq 5 ]; then
   log_line "=== Recording ==="
   log_line "Ended because: ${KEY_REASON:-unknown}"
+  [ "$MEDIA_RESUMED" -eq 1 ] && log_line "Media: paused while recording, resumed"
   log_line "Result: [cancelled]"
   play_sound "$cancel_sound"
   # On 5 the pill is already animating into the history window: leave it be.
@@ -1383,6 +1449,7 @@ fi
 log_line "=== Recording ==="
 log_line "Duration: ${RECORDING_DURATION}s, Size: ${RECORDING_SIZE} bytes"
 log_line "Ended because: ${KEY_REASON:-unknown}"
+[ "$MEDIA_RESUMED" -eq 1 ] && log_line "Media: paused while recording, resumed"
 
 # Speed: the upload to Whisper starts now, beside the silence check (two ffmpeg
 # passes) and the front-window lookup, instead of after them. A silent clip stops

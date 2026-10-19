@@ -8,6 +8,7 @@ import Foundation
 //   ax       focused text field as JSON, for xhisper-learn
 //   front    frontmost app: bundle id, name, window title
 //   paste    Cmd+V into the focused app
+//   media    pause / resume the Now Playing app (pause-media)
 
 // macOS otherwise quits the window/pill on its own (automatic termination).
 ProcessInfo.processInfo.disableAutomaticTermination("xhisper")
@@ -29,8 +30,9 @@ case "hotkey": exit(Hotkey.main(rest))
 case "ax": exit(AXCommand.main(rest))
 case "front": exit(AXCommand.front())
 case "paste": exit(Paste.main(rest))
+case "media": exit(Media.main(rest))
 case "--version", "-V": print("Xhisper \(xhisperVersion)"); exit(0)
 default:
-    FileHandle.standardError.write(Data("usage: Xhisper hotkey|notify|history|ax|front|paste|--version\n".utf8))
+    FileHandle.standardError.write(Data("usage: Xhisper hotkey|notify|history|ax|front|paste|media|--version\n".utf8))
     exit(1)
 }
