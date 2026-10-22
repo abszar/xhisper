@@ -693,21 +693,118 @@ curl_auth_config() {
   [ -n "$key" ] && printf 'header = "Authorization: Bearer %s"\n' "$key"
 }
 
+# With language "en", an English sentence starts the Whisper prompt. A prompt
+# in the target language is Whisper's own way to hold it there; turbo ignores
+# the language field (French speech stays French under "en", 2026-10-22).
+ENGLISH_HINT="Hello, this is an English dictation."
+whisper_prompt() {
+  if [ "$language" = "en" ]; then
+    printf '%s' "$ENGLISH_HINT${transcription_prompt:+ $transcription_prompt}"
+  else
+    printf '%s' "$transcription_prompt"
+  fi
+}
+
 # Whisper sometimes ends a recording by repeating its prompt (the dictionary
 # hint list), e.g. "...inside the folder TOSIAM, coolify". Drop that tail when
-# the transcript ends with the whole prompt (2+ words, punctuation ignored).
+# the transcript ends with the whole prompt (2+ words, punctuation ignored),
+# and the English hint sentence wherever it opens or closes the transcript.
 strip_prompt_echo() {
-  [ -n "$transcription_prompt" ] || { printf '%s' "$1"; return; }
-  printf '%s\0%s' "$1" "$transcription_prompt" | python3 -I -c '
+  local hint=""
+  [ "$language" = "en" ] && hint="$ENGLISH_HINT"
+  [ -n "$transcription_prompt$hint" ] || { printf '%s' "$1"; return; }
+  printf '%s\0%s\0%s' "$1" "$transcription_prompt" "$hint" | python3 -I -c '
 import re, sys
-text, prompt = sys.stdin.buffer.read().decode("utf-8", "replace").split("\0", 1)
-words = re.findall(r"\w[\w.+#-]*", prompt)
-if len(words) >= 2:
-    tail = r"[\W_]*" + r"[\W_]+".join(re.escape(w) for w in words) + r"[\W_]*$"
-    cut = re.sub(tail, "", text, flags=re.I)
+text, prompt, hint = sys.stdin.buffer.read().decode("utf-8", "replace").split("\0", 2)
+def pattern(s):
+    words = [w.rstrip(".-") for w in re.findall(r"\w[\w.+#-]*", s)]
+    return r"[\W_]+".join(re.escape(w) for w in words) if len(words) >= 2 else ""
+words = pattern(prompt)
+if words:
+    cut = re.sub(r"[\W_]*" + words + r"[\W_]*$", "", text, flags=re.I)
     if cut != text:
-        text = cut.rstrip(" ,;:-") 
+        text = cut.rstrip(" ,;:-")
+words = pattern(hint)
+if words:
+    text = re.sub(r"^\W*" + words + r"[\W_]*", "", text, flags=re.I)
+    text = re.sub(r"[\s,;:-]*" + words + r"[\W_]*$", "", text, flags=re.I)
 sys.stdout.write(text)'
+}
+
+# Exit 0 when a transcript asked for in English reads like another language:
+# two French function words, or three letters outside ASCII (accents, another
+# script). English with a name like "Amélie" or "café" stays under it.
+looks_foreign() {
+  printf '%s' "$1" | python3 -I -c '
+import re, sys
+text = sys.stdin.read().replace("’", "\x27").lower()
+words = re.findall(r"[^\W\d_]+(?:\x27[^\W\d_]+)?", text)
+french = set("""je tu il elle nous vous ils elles le la les une des du au aux
+et est sont pas ne que qui quoi pourquoi avec dans sur mais ou où donc ce cette
+ces cet mon ma mes ton ta tes votre vos notre nos leur très aussi combien
+bonjour merci oui ça c\x27est j\x27ai n\x27est qu\x27il d\x27un l\x27on""".split())
+hits = sum(w in french for w in words)
+foreign = sum(1 for c in text if c.isalpha() and ord(c) > 127)
+sys.exit(0 if hits >= 2 or foreign >= 3 else 1)'
+}
+
+# One transcription request; prints the raw response. $3 empty = auto-detect.
+stt_request() {
+  local recording="$1" model="$2" lang="$3" format="$4" prompt="$5"
+  local curl_args=(-s -X POST "${stt_url}/audio/transcriptions"
+    --connect-timeout 5 --max-time "$stt_timeout" --retry 1 --retry-delay 1
+    -H "Content-Type: multipart/form-data"
+    -F "file=@$recording"
+    -F "model=$model"
+    -F "prompt=$prompt")
+  [ -n "$lang" ] && curl_args+=(-F "language=$lang")
+  [ -n "$format" ] && curl_args+=(-F "response_format=$format")
+  curl_auth_config "$stt_api_key" | curl -K - "${curl_args[@]}"
+}
+
+# Mean avg_logprob of a verbose_json response, weighted by segment length.
+stt_logprob() {
+  jq -s -r '.[-1].segments // empty | map({d: ((.end - .start) | if . > 0 then . else 0.01 end), l: .avg_logprob})
+    | if length > 0 then ((map(.d * .l) | add) / (map(.d) | add)) else empty end' "$1" 2>/dev/null
+}
+
+# Turbo ignores the language field and, on English spoken with a French accent,
+# now and then writes French: a translation (2026-10-22, "Can you also find out
+# how much I spent in total in 2026" came out "Pouvez-vous aussi savoir combien
+# j'ai dépensé..."). Real French must stay French, and auto-detect is no judge:
+# whisper-large-v3 detects French on that accent too. What tells them apart is
+# confidence: large-v3 forced to the spoken language scores clearly better
+# (English speech: en -0.36 / fr -0.77; French speech: fr -0.11 / en -0.33).
+# So: large-v3 forced to "en" and on auto-detect, in parallel. English clearly
+# surer (by RECHECK_MARGIN): its "en" text. A real voice saying "Bonjour,
+# comment ça va" in French scored en -0.21 / fr -0.25, a near tie that a plain
+# comparison gave to English and translated, so a tie keeps what was heard. Otherwise the first transcript stays (turbo's own French was
+# as good: "macOS" where large-v3 heard "ma cosse").
+RECHECK_MARGIN=0.15
+recheck_language() {
+  local recording="$1" first="$2"
+  local en_file="$RUNTIME_DIR/stt-recheck-en.json" auto_file="$RUNTIME_DIR/stt-recheck-auto.json"
+  stt_request "$recording" whisper-large-v3 en verbose_json "$(whisper_prompt)" > "$en_file" 2>/dev/null &
+  local en_pid=$!
+  stt_request "$recording" whisper-large-v3 "" verbose_json "$transcription_prompt" > "$auto_file" 2>/dev/null
+  wait "$en_pid" 2>/dev/null
+  local en_text auto_lang en_lp auto_lp choice
+  en_text=$(jq -s -r '.[-1].text // empty' "$en_file" 2>/dev/null | sed 's/^ //')
+  auto_lang=$(jq -s -r '.[-1].language // empty' "$auto_file" 2>/dev/null)
+  en_lp=$(stt_logprob "$en_file")
+  auto_lp=$(stt_logprob "$auto_file")
+  rm -f "$en_file" "$auto_file"
+  if [ -z "$en_text" ]; then
+    choice="first"
+  elif [ "$(printf '%s' "$auto_lang" | tr '[:upper:]' '[:lower:]')" = "english" ] || [ "$auto_lang" = "en" ]; then
+    choice="en"
+  elif [ -n "$en_lp" ] && [ -n "$auto_lp" ]; then
+    choice=$(LC_ALL=C awk -v e="$en_lp" -v a="$auto_lp" -v m="$RECHECK_MARGIN" 'BEGIN { print (e - a >= m) ? "en" : "first" }')
+  else
+    choice="first"
+  fi
+  log_line "Language recheck: en $(LC_ALL=C awk -v v="${en_lp:-0}" 'BEGIN { printf "%.2f", v }'), ${auto_lang:-?} $(LC_ALL=C awk -v v="${auto_lp:-0}" 'BEGIN { printf "%.2f", v }') -> $([ "$choice" = en ] && echo English || echo "kept as heard")"
+  if [ "$choice" = "en" ]; then printf '%s' "$en_text"; else printf '%s' "$first"; fi
 }
 
 transcribe() {
@@ -722,20 +819,17 @@ transcribe() {
     model=$([ "$is_long_recording" = "1" ] && echo "whisper-large-v3" || echo "whisper-large-v3-turbo")
   fi
 
-  local curl_args=(-s -X POST "${stt_url}/audio/transcriptions"
-    --connect-timeout 5 --max-time "$stt_timeout" --retry 1 --retry-delay 1
-    -H "Content-Type: multipart/form-data"
-    -F "file=@$recording"
-    -F "model=$model"
-    -F "prompt=$transcription_prompt")
-  [ -n "$language" ] && curl_args+=(-F "language=$language")
-
   local raw_response
-  raw_response=$(curl_auth_config "$stt_api_key" | curl -K - "${curl_args[@]}")
+  raw_response=$(stt_request "$recording" "$model" "$language" "" "$(whisper_prompt)")
   # A retried request prints both bodies, so only the last document counts.
   local transcription
   transcription=$(printf '%s' "$raw_response" | jq -s -r '.[-1].text // empty' 2>/dev/null | sed 's/^ //')
   transcription=$(strip_prompt_echo "$transcription")
+
+  # Only with the auto-picked Groq models: the recheck names whisper-large-v3.
+  if [ -n "$transcription" ] && [ "$language" = "en" ] && [ -z "$stt_model" ] && looks_foreign "$transcription"; then
+    transcription=$(strip_prompt_echo "$(recheck_language "$recording" "$transcription")")
+  fi
 
   if [ -z "$transcription" ]; then
     local api_error

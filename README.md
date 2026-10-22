@@ -39,6 +39,7 @@ Voice-to-text dictation at cursor for **Linux and macOS**. Based on [imaginalnik
 | Hold-to-talk dictation, paste at cursor | ✅ | ✅ toggle (tap Option → Control), native Cmd+V (TextEdit verified); hold-to-talk (keep Control held) ✅ (TextEdit, iTerm2) |
 | AI auto-edit, tone adaptation, answer guard | ✅ | ✅ (shared code) |
 | Personal dictionary (Whisper hints + auto-edit vocabulary) | ✅ | ✅ (shared code) |
+| `language : en` recheck: accented English that Whisper turned into French is redone in English, real French kept | ⏳ shared code, untested on a real dictation here | ✅ real voice: "Bonjour, comment ça va ?" kept French, English with French words in it kept English (2026-10-22); synthetic accented English redone in English; a real accented-English drift not caught yet ⏳ |
 | `--toggle` mode, Escape to cancel, sound cues | ✅ | ✅ (toggle and Escape verified in TextEdit; the agent swallows Escape) |
 | Alt → Ctrl toggle hotkey | ✅ X11 (`xhisper-hotkey`) | ✅ Xhisper.app hotkey LaunchAgent |
 | Overlay pill with live waveform, History chip, Learned/Unlearn pill | ✅ | ✅ native panel |

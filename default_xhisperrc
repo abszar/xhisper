@@ -14,6 +14,9 @@ transcription-prompt     : ""
 # Leave empty to let Whisper auto-detect the spoken language (English, French,
 # Spanish, etc. are all transcribed in their own script). Set to an ISO 639-1
 # code (en, fr, de, es, ar, ...) to force a specific language instead.
+# With "en", a dictation that comes back looking French is checked again
+# with whisper-large-v3: kept as French when you really spoke French, redone
+# in English when it was a translation of English speech (~0.5 s, rare).
 language                 : ""
 
 # Recording:
